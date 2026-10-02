@@ -1,0 +1,46 @@
+name: your-skill-name
+purpose: >
+  One or two sentences describing the durable job of this skill in the vault.
+trigger:
+  user_phrases:
+    - example user wording
+  intent_signals:
+    - underlying user intent this skill should catch
+inputs:
+  required:
+    - name: primary_input
+      description: The minimum input required to run the workflow.
+  optional:
+    - name: optional_constraint
+      description: Optional detail that changes scope, output, or filtering.
+outputs:
+  primary:
+    - path: wiki/syntheses/example-output.md
+      description: Durable artifact or main destination.
+  side_effects:
+    - wiki/log.md updated
+dependencies:
+  skills: []
+  scripts: []
+  tools: []
+  env:
+    - .venv/bin/python3
+  external_services: []
+failure_modes:
+  - mode: missing_input
+    detection: Required input is absent or ambiguous.
+    response: Ask one focused clarification question or stop with a concrete blocker.
+evaluation:
+  success_signals:
+    - The expected output exists and matches the requested scope.
+  checks:
+    - Validate the main artifact path and inspect the key section headings.
+  artifacts:
+    - wiki/syntheses/example-output.md
+schedule_eligibility:
+  eligible: false
+  execution_mode: local_only
+  rationale: >
+    Default to manual execution until the workflow is deterministic, validated,
+    and safe to run unattended.
+  cadence_examples: []

@@ -1,0 +1,106 @@
+name: skill-creator
+purpose: >
+  Create vault-local skills, and update and test existing skills (one or a whole
+  skills root at once) via staged edits, tiered tests and per-skill acceptance,
+  so every skill ships with a canonical manifest and follows current best practices.
+trigger:
+  user_phrases:
+    - create a skill
+    - build a local skill
+    - standardize this skill
+    - create a skill creator workflow
+    - update this skill
+    - improve / fix this skill
+    - audit skills against best practices
+    - 更新 skill
+    - update all skills
+    - batch update skills
+    - test this skill
+    - 批量更新 skill
+  intent_signals:
+    - The user wants a new repo-local skill under .codex/skills.
+    - The user wants an existing local skill updated, improved or brought in line with current best practices.
+    - The user wants to normalize an existing local skill to the repo schema.
+    - The user wants a canonical skill metadata manifest or validation flow.
+inputs:
+  required:
+    - name: skill_goal
+      description: The workflow or capability the local skill should provide.
+  optional:
+    - name: target_skill_name
+      description: Explicit folder name if the user already chose one.
+    - name: supporting_scripts
+      description: Repo-local scripts or references the skill should call or reuse.
+outputs:
+  primary:
+    - path: .codex/skills/<skill-name>/SKILL.md
+      description: Triggerable local skill instructions.
+    - path: .codex/skills/<skill-name>/skill.yaml
+      description: Canonical manifest used for future registry and validation work.
+    - path: .codex/skills/<skill-name>/evals/
+      description: Stored trigger.json / evals.json test cases (not packaged).
+    - path: outputs/skill-evals/batch-<id>/
+      description: Update run dir — report.md, targets.tsv, baseline/, staging/, tests/.
+  side_effects:
+    - Optional scripts, references, or assets are added under the skill folder.
+    - wiki/syntheses/ may be updated when the workflow decision is worth persisting.
+    - wiki/log.md may be updated when the change is substantive.
+    - Accepting a staged update rewrites the live skill dir via accept_skill.py (lock, drift check, runtime state preserved).
+    - "Outside write_paths, each only after user confirmation: accepting into non-vault skill roots, propagating to ~/.claude/skills/<name>/ (accept_skill.py --propagate), and rebuilding AI_Workspace/.codex/registry.{json,md}."
+    - T1/T2 tests run in disposable temp dirs (mktemp) that are deleted afterwards.
+dependencies:
+  skills:
+    - anthropic-skills:skill-creator (official; evals, benchmarks, description optimization; optional)
+  scripts:
+    - .codex/skills/skill-creator/scripts/validate_skill_manifest.py
+    - .codex/skills/skill-creator/scripts/lint_skill.py
+    - .codex/skills/skill-creator/scripts/accept_skill.py
+    - .codex/skills/skill-creator/scripts/t1_check.py
+  tools:
+    - python3
+    - PyYAML
+  env:
+    - .venv/bin/python3
+  external_services: []
+failure_modes:
+  - mode: ambiguous_scope
+    detection: The requested skill goal or boundaries are unclear.
+    response: Ask one focused clarification question or define the narrowest safe scope.
+  - mode: invalid_manifest
+    detection: skill.yaml fails schema validation or does not match the skill folder name.
+    response: Fix the manifest fields before treating the skill as complete.
+  - mode: overbuilt_skill
+    detection: The skill accumulates README-style docs or resources not required by the workflow.
+    response: Remove nonessential files and keep the skill focused on operational guidance.
+  - mode: live_skill_diverged
+    detection: accept_skill.py exits 4 (live copy changed since staging) or 3 (another accept holds the lock).
+    response: Do not force; re-stage from the current live copy and re-review, or retry after the other run finishes.
+  - mode: trigger_test_inconclusive
+    detection: Visibility probe cannot show the installed copy is hidden, or claude/official copy unavailable.
+    response: Report T1 as inconclusive or unavailable; never count it as a pass.
+evaluation:
+  success_signals:
+    - The skill folder contains both SKILL.md and skill.yaml.
+    - The manifest validates successfully.
+    - lint_skill.py reports 0 errors.
+    - The workflow instructions match the declared metadata and dependencies.
+  checks:
+    - Run the validator on the target skill.
+    - Run lint_skill.py on the target skill (add --upload for claude.ai/API skills).
+    - Confirm the manifest fields cover purpose, trigger, inputs, outputs, dependencies, failure modes, evaluation, and schedule eligibility.
+  artifacts:
+    - .codex/skills/<skill-name>/SKILL.md
+    - .codex/skills/<skill-name>/skill.yaml
+schedule_eligibility:
+  eligible: false
+  execution_mode: local_only
+  rationale: >
+    Skill creation changes repo behavior and should stay human-invoked until a
+    broader registry, review, and approval loop exists.
+  cadence_examples: []
+security:
+  risk_level: write
+  confirmation_required: false
+  reason: Writes skill files under .codex/skills/ (new skills, accepted updates) and run artifacts and locks under outputs/skill-evals/; delegated official description optimization writes temporary command stubs to .claude/commands/ and removes them; human-invoked only.
+  write_paths: [".codex/skills/<name>/", "outputs/skill-evals/", ".claude/commands/"]
+agents: [claude, codex]

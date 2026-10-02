@@ -1,0 +1,12 @@
+[
+  {"query": "can you update the notebooklm skill in my vault so it follows the new skill best practices? its api_reference.md has no table of contents", "should_trigger": true},
+  {"query": "批量更新一下 .codex/skills 下面所有的 skill，先给我一个 dry-run 报告", "should_trigger": true},
+  {"query": "I want a new local skill under .codex/skills that turns my meeting notes into a weekly summary, with a skill.yaml manifest", "should_trigger": true},
+  {"query": "audit all my vault skills against the current anthropic skill authoring guidelines and tell me what you'd change", "should_trigger": true},
+  {"query": "the yt-transcript skill keeps missing the fallback step, fix the skill and test it before we accept the change", "should_trigger": true},
+  {"query": "run the yt-pipeline on this youtube url and save the research doc to obsidian", "should_trigger": false},
+  {"query": "what does my wiki say about prompt caching? cite the pages", "should_trigger": false},
+  {"query": "write a python script that renames all the PDFs in my downloads folder by date", "should_trigger": false},
+  {"query": "rebuild the skill registry json so the dashboard picks up the latest manifests", "should_trigger": false},
+  {"query": "review this pull request for bugs before I merge it", "should_trigger": false}
+]
