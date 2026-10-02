@@ -11,7 +11,10 @@ streamed arguments contain the runner's complete stub name ("<skill>-skill-" + 8
 trigger; a truncated name is not enough), because the runner waits
 for those arguments. Any error result makes the call undecided. A run is valid only if
 the number of calls equals the expected queries x runs from the runner's results, every call was
-decided, and stderr holds nothing but known-benign warnings.
+decided, stderr holds nothing but known-benign warnings, and the trigger outcomes reconstructed
+from the logs match the runner's per-query trigger counts. The runner can drop the last chunk of
+a stream when the process exits, so a mismatch is possible and makes the run inconclusive.
+calls.log holds one line per call with the call's arguments (the query is among them).
 
 Usage: python3 t1_check.py <disposable dir T> <run_eval results.json>   (exit 0 valid, 1 inconclusive)
        python3 t1_check.py --self-test
@@ -77,6 +80,30 @@ def decided(seg: list[dict], skill_name: str) -> bool:
     return False
 
 
+def triggered(seg: list[dict], skill_name: str) -> bool:
+    """Whether the call selected the runner's stub (streamed Skill/Read args or full message)."""
+    stub = re.compile(re.escape(f"{skill_name}-skill-") + r"[0-9a-f]{8}")
+    args, pending = "", False
+    for e in seg:
+        if e.get("type") == "stream_event":
+            ev = e.get("event") or {}
+            block = ev.get("content_block") or {}
+            if ev.get("type") == "content_block_start" and block.get("type") == "tool_use":
+                pending, args = block.get("name") in ("Skill", "Read"), ""
+            elif ev.get("type") == "content_block_delta" and pending:
+                args += (ev.get("delta") or {}).get("partial_json", "")
+                if stub.search(args):
+                    return True
+        elif e.get("type") == "assistant":
+            for c in (e.get("message") or {}).get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    inp = c.get("input") or {}
+                    target = inp.get("skill", "") if c.get("name") == "Skill" else inp.get("file_path", "")
+                    if c.get("name") in ("Skill", "Read") and stub.search(str(target)):
+                        return True
+    return False
+
+
 def check(t: Path, results: Path) -> bool:
     read = lambda name: (t / name).read_text(errors="replace").splitlines() if (t / name).is_file() else []
     calls, segs = len(read("calls.log")), segments(read("stdout.log"))
@@ -84,6 +111,7 @@ def check(t: Path, results: Path) -> bool:
         data = json.loads(results.read_text())
         expected = sum(int(r["runs"]) for r in data["results"])
         skill_name = str(data["skill_name"])
+        queries = [(str(r["query"]), int(r["triggers"])) for r in data["results"]]
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"INCONCLUSIVE: cannot read skill name / expected run count from {results}: {exc}")
         return False
@@ -93,7 +121,21 @@ def check(t: Path, results: Path) -> bool:
           f"stderr_errors={len(errors)}")
     for e in errors[:5]:
         print(f"  stderr: {e[:200]}")
-    ok = expected > 0 and calls == len(segs) == expected and not undecided and not errors
+    # map each logged call to its query (longest query text contained in the call's arguments)
+    lines = read("calls.log")
+    logged: dict[str, int] = {q: 0 for q, _ in queries}
+    unmapped = 0
+    for i, line in enumerate(lines):
+        hits = [q for q, _ in queries if q and q.replace("\n", " ") in line]
+        if not hits:
+            unmapped += 1
+        elif i < len(segs) and triggered(segs[i], skill_name):
+            logged[max(hits, key=len)] += 1
+    mismatched = [q[:60] for q, n in queries if logged.get(q, 0) != n]
+    if unmapped or mismatched:
+        print(f"  unmapped calls={unmapped}; runner vs log trigger counts differ for: {mismatched or 'none'}")
+    ok = (expected > 0 and calls == len(segs) == expected and not undecided and not errors
+          and not unmapped and not mismatched)
     print("valid" if ok else "INCONCLUSIVE: do not score this T1 run")
     return ok
 
@@ -128,11 +170,29 @@ def self_test() -> None:
     for name, calls, runs, out, err, expect in cases:
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp)
-            (t / "calls.log").write_text("call\n" * calls)
+            (t / "calls.log").write_text("--settings x -p the query --verbose\n" * calls)
             (t / "stdout.log").write_text("\n".join(out) + "\n")
             (t / "stderr.log").write_text(err)
-            (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [{"runs": runs}]}))
+            trig = sum(1 for sg in segments(out) if triggered(sg, "demo"))
+            (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
+                {"query": "the query", "runs": runs, "triggers": trig}]}))
             assert check(t, t / "results.json") is expect, name
+
+    # the runner recorded "not triggered" although the log shows a full stub selection -> inconclusive
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        (t / "calls.log").write_text("-p q1\n-p q2\n")
+        (t / "stdout.log").write_text("\n".join([init, start("Skill"), arg('{"skill": "demo-skill-1a2b3c4d"}'),
+                                                 init, start("Bash")]) + "\n")
+        (t / "stderr.log").write_text("")
+        (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
+            {"query": "q1", "runs": 1, "triggers": 0}, {"query": "q2", "runs": 1, "triggers": 0}]}))
+        assert check(t, t / "results.json") is False
+        (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
+            {"query": "q1", "runs": 1, "triggers": 1}, {"query": "q2", "runs": 1, "triggers": 0}]}))
+        assert check(t, t / "results.json") is True
+        (t / "calls.log").write_text("-p something else\n-p q2\n")  # a call that matches no query
+        assert check(t, t / "results.json") is False
     print("self-test ok")
 
 

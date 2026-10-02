@@ -52,15 +52,19 @@ Dry-run is the default. Apply only after the user has approved the dry-run repor
    stop. Ask the user which skills to apply, if any.
 3. **Apply** (approved skills only):
    - Copy each skill twice: an immutable baseline at `$R/baseline/<key>/<name>/` and an editable copy
-     at `$R/staging/<key>/<name>/`. Use `cp -R <dir>/. <dest>/`.
+     at `$R/staging/<key>/<name>/`. Use `cp -Rp <dir>/. <dest>/`, because `-p` keeps file modes
+     (without it, umask changes them and acceptance reports false drift).
+   - Right after copying, confirm both copies equal the live skill:
+     `PY SC/scripts/accept_skill.py --same <canonical path> <copy>` must print `same`.
    - Before any edit, check the staging copy for symlinks that point outside it. An edit made through
      such a link would change the original.
      `PY SC/scripts/accept_skill.py --check-links <staging copy> --identity <canonical path>` must exit
      0; the skill's declared runtime state, such as a `.toolvenv`, is exempt. If it exits 1, don't
      edit that skill. Report the links, and suggest declaring them as runtime state if they belong
      to a venv.
-   - Edit only the staging copies: `--fix-toc` (always with `--within <staging copy>`, so it refuses to
-     edit through a symlink or outside the copy), the judgment items, and missing evals. Mark drafted
+   - Edit only the staging copies: `--fix-toc` (always with `--within <staging copy>`; it refuses to edit
+     through a symlink, outside the copy, or any file that isn't a reference `.md`), the judgment
+     items, and missing evals. Mark drafted
      evals "new — needs user review"; they don't count as proof until the user has seen them.
    - Run the test tiers against the staging copies.
    - Allow at most 2 fix attempts per skill. If it still fails, mark it FAILED and don't accept its
@@ -88,11 +92,24 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
 1. Create a disposable dir: `T=$(mktemp -d) && mkdir -p "$T/.claude/commands" "$T/bin" && echo "$T"`.
    Write `$T/override.json` with
    `{"skillOverrides": {"<name>": "off"}, "disableSkillShellExecution": true}`.
-   Then create a `claude` shim that injects it:
-   `printf '#!/bin/bash\necho call >> "%s/calls.log"\nexec > >(tee -a "%s/stdout.log") 2>>"%s/stderr.log" < /dev/null\nexec "%s" --settings "%s" "$@"\n' "$T" "$T" "$T" "$(command -v claude)" "$T/override.json" > "$T/bin/claude" && chmod +x "$T/bin/claude"`.
-   The shim logs every call, its stream-json stdout and its stderr, because the official runner
-   throws all three away. Stdin comes from `/dev/null`, so claude does not print a "no stdin"
-   warning. `exec` keeps the PID, so the runner can still stop the call.
+   Then create a `claude` shim that injects it. Run the block without the list indentation, because
+   the closing `EOF` must start its line:
+   ```bash
+   cat > "$T/bin/claude" <<EOF
+   #!/bin/bash
+   echo "\${*//\$'\n'/ }" >> "$T/calls.log"
+   exec > >(tee -a "$T/stdout.log") 2>>"$T/stderr.log" < /dev/null
+   exec "$(command -v claude)" --settings "$T/override.json" "\$@"
+   EOF
+   chmod +x "$T/bin/claude"
+   ```
+   The shim records, for every call:
+   - its arguments in `calls.log` (one line per call, so the call can be matched to its query);
+   - its stream-json stdout in `stdout.log`;
+   - its stderr in `stderr.log`.
+
+   The official runner throws all of these away. Stdin comes from `/dev/null`, so claude prints
+   no "no stdin" warning. `exec` keeps the PID, so the runner can still stop the call.
    Use the shim because `skillOverrides` in a project settings file does **not** hide user-level
    skills, while `--settings` does. Never edit the vault's own settings.
 2. Get the trigger text: `PY SC/scripts/lint_skill.py --trigger-text <staging copy>`. It must exit 0
@@ -121,6 +138,8 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
    - the number of calls equals the expected queries × runs;
    - every call reached a decision by the runner's own rules (another tool chosen, a Skill/Read
      block completed or naming the runner's stub, or a clean result);
+   - for every query, the trigger count rebuilt from the logs equals the runner's count (the
+     runner can drop the last chunk of a stream when the process exits);
    - no call ended in an error result;
    - stderr holds only known-benign warnings. Timeouts, crashes and error results make the run
    **inconclusive**: do not score it, and report the checker's output. Copy the three logs to
@@ -142,9 +161,12 @@ missing, or `claude` is not on PATH, report T1 as unavailable.
   - empty `dependencies.external_services`;
   - every `write_paths` and `outputs` path is relative and does not escape (no leading `/` or `~`,
     no `..` after normalization);
-  - SKILL.md names no network or API calls;
+  - no file the run can read names network/API calls, publishing, sending, or writes outside the
+    run dir. That covers SKILL.md and every reference, asset, eval and fixture in the candidate and
+    in the dependency closure. A reference you could not inspect counts as unsafe;
   - every skill in the **dependency closure** is itself safe. The closure is `dependencies.skills`,
-    followed transitively; track visited names to stop on cycles.
+    followed transitively. Seed the visited set with the target itself, so a cycle (A→B→A) or a
+    self-dependency never puts the target in its own closure.
 - Classify again on the **final staging candidate** and its dependencies right before running T2.
   A staged change that adds code, for example a new validator script, turns a safe skill unsafe.
 - Everything else is *unsafe*. For example, skill-registry is unsafe: its scripts write
@@ -153,7 +175,11 @@ missing, or `claude` is not on PATH, report T1 as unavailable.
 - Run each case in a disposable mini-vault: `W=$(mktemp -d)`.
   - Copy the staging copy to `$W/.codex/skills/<name>/`.
   - Copy every skill in the dependency closure from its current original, and record each copy's
-    name and SKILL.md sha256.
+    name and SKILL.md sha256. Never copy anything (dependencies, fixtures) over
+    `$W/.codex/skills/<name>/`.
+  - After setup, the disposable candidate must still match the reviewed staging copy exactly:
+    `diff -r $R/staging/<key>/<name> "$W/.codex/skills/<name>"` must print nothing. Otherwise T2
+    would grade some other version.
   - Copy in any fixtures.
   - Before launching, check that no symlink under `$W` is absolute or resolves outside `$W`, dangling
     ones included: `PY SC/scripts/accept_skill.py --check-links "$W"` must exit 0.
@@ -175,12 +201,20 @@ missing, or `claude` is not on PATH, report T1 as unavailable.
 Acceptance is a fragile operation, so a script does it:
 
 - Accept: `PY SC/scripts/accept_skill.py --run $R --key <key> --live <canonical path> [--dry-run]`.
-  - It takes a non-blocking lock under `outputs/skill-evals/locks/`. The lock is released when the
-    process exits.
+  - It takes a non-blocking lock under `outputs/skill-evals/locks/`, named by the canonical-path
+    key. Acceptance and propagation share that one namespace, so they can't change the same
+    directory at the same time. The lock is released when the process exits. `--key` must equal
+    the canonical-path key of `--live`, or the run is refused.
   - It refuses if the live copy changed since staging (exit 4 = re-stage and re-review).
+  - It refuses (exit 2, nothing copied) if any involved `skill.yaml` can't be read, or declares the
+    whole skill dir writable (`.codex/skills/<name>/`), or declares state through a symlink (for example
+    `cache/state.json` where `cache -> data`), because the runtime state can't be inferred then.
+    For the symlink case, protect the resolved files (`--protect data/state.json`). Proceed only after the user reviews a full `--protect` list,
+    passing `--ignore-bad-manifest`.
   - It protects runtime state: the union of the state paths declared by the live, baseline and
-    staging manifests, plus every path protected by an earlier acceptance of the same skill (records
-    in `outputs/skill-evals/accepted/`). Retiring a protected state path is a separate decision the
+    staging manifests, plus every path protected for that directory by an earlier acceptance or
+    propagation (records in `outputs/skill-evals/accepted/` and `propagated/`, both keyed by the
+    canonical path). Retiring a protected state path is a separate decision the
     user makes explicitly, by editing that record.
   - Drift checks, verification and records compare entry type, exec bits, symlink targets and
     content, not just file bytes.
@@ -191,6 +225,8 @@ Acceptance is a fragile operation, so a script does it:
   `PY SC/scripts/accept_skill.py --propagate <vault skill dir> --dry-run`, show the preview, then
   run it again without `--dry-run`.
   - It refuses a symlinked destination (exit 6).
+  - It holds the source's lock (shared with acceptance) and a destination lock for the whole sync
+    (exit 3 = busy). The same unreadable-manifest rule applies.
   - It protects the union of the source state paths, the destination state paths, and every path
     protected in earlier syncs. A sync record kept in `outputs/skill-evals/propagated/` remembers them.
   - It refuses with exit 7 when the destination differs from the source and holds changes this script

@@ -237,17 +237,23 @@ def has_contents(lines: list[str], start: int = 0, end: int | None = None) -> bo
 
 
 def through_symlink(path: Path, within: Path) -> str | None:
-    """Why editing `path` could touch something outside `within`, or None if it is safe:
-    the file or any directory between it and `within` is a symlink, or it lies outside."""
-    root = Path(os.path.abspath(within))
-    p = Path(os.path.abspath(path))
-    if root != p and root not in p.parents:
+    """Why editing `path` could touch something outside `within`, or None if it is safe.
+    Checks the path exactly as it will be opened: no ".." components (they would be collapsed by
+    normalisation but followed by the OS through symlinks), `within` itself not a symlink, and no
+    symlink among the components from `within` down to the file."""
+    if ".." in Path(path).parts or ".." in Path(within).parts:
+        return "path contains '..'"
+    root = Path(within) if Path(within).is_absolute() else Path.cwd() / within
+    p = Path(path) if Path(path).is_absolute() else Path.cwd() / path
+    if root.is_symlink():
+        return f"{within} is a symlink"
+    if p.parts[:len(root.parts)] != root.parts or p == root:
         return f"outside {within}"
-    cur = p
-    while cur != root:
+    cur = root
+    for part in p.parts[len(root.parts):]:
+        cur = cur / part
         if cur.is_symlink():
             return f"{cur} is a symlink"
-        cur = cur.parent
     if not os.path.realpath(p).startswith(os.path.realpath(root) + os.sep):
         return f"resolves outside {within}"
     return None
@@ -260,6 +266,12 @@ def fix_toc(path: Path, within: Path | None = None) -> str:
     why = through_symlink(path, within or Path.cwd())
     if why:
         return f"refused: {why}"
+    rel = Path(os.path.abspath(path)).relative_to(Path(os.path.abspath(within or Path.cwd())))
+    if (path.suffix.lower() != ".md" or path.name.upper() == "SKILL.MD"
+            or (len(rel.parts) > 1 and rel.parts[0] in SKIP_DIRS)
+            or any(part.startswith(".") for part in rel.parts)
+            or {"node_modules", "__pycache__"} & set(rel.parts)):
+        return "refused: not a reference .md file (SKILL.md, scripts/, assets/, evals/ and non-.md are never edited)"
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     if len(lines) <= TOC_THRESHOLD:
         return "skip: not over 100 lines"
@@ -464,10 +476,10 @@ def self_test() -> None:
         sections = "".join(f"## Part {i}\n" + "text\n" * 20 for i in range(1, 6))
         ref = s / "references" / "long.md"
         write(ref, "# Long\n" + sections)
-        assert fix_toc(ref, root).startswith("inserted contents list (5 entries)")
+        assert fix_toc(ref, s).startswith("inserted contents list (5 entries)")
         text = ref.read_text()
         assert text.splitlines()[2] == "## Contents" and "- Part 5\n" in text
-        assert fix_toc(ref, root) == "ok: has contents list"
+        assert fix_toc(ref, s) == "ok: has contents list"
         assert ref.read_text() == text
         write(s / "SKILL.md", "---\nname: demo\ndescription: d\n---\nRead `references/long.md`.\n")
         assert ("long.md", "toc") not in rules(s)
@@ -475,36 +487,36 @@ def self_test() -> None:
         # late contents list -> no edit; H1 beyond the first 5 body lines -> insert at body start
         write(ref, "# Long\n" + sections + "## Contents\n- x\n")
         before = ref.read_text()
-        assert fix_toc(ref, root).startswith("late contents list") and ref.read_text() == before
+        assert fix_toc(ref, s).startswith("late contents list") and ref.read_text() == before
         write(ref, "intro\n" * 6 + "# Title\n" + sections)
-        fix_toc(ref, root)
+        fix_toc(ref, s)
         assert ref.read_text().splitlines()[1] == "## Contents"
 
         # frontmatter preserved; contents inserted after it, or refused if beyond the window
         write(ref, "---\ntitle: t\n---\n# Long\n" + sections)
-        fix_toc(ref, root)
+        fix_toc(ref, s)
         lines = ref.read_text().splitlines()
         assert lines[0] == "---" and lines[2] == "---" and lines[5] == "## Contents", lines[:7]
         write(ref, "---\n" + "k: v\n" * 30 + "---\n# Long\n" + sections)
         before = ref.read_text()
-        assert fix_toc(ref, root).startswith("manual fix needed") and ref.read_text() == before
+        assert fix_toc(ref, s).startswith("manual fix needed") and ref.read_text() == before
 
         # `## ` inside a code fence is not a heading
         write(ref, "# Long\n```\n## not a heading\n```\n" + sections)
-        fix_toc(ref, root)
+        fix_toc(ref, s)
         assert "- not a heading" not in ref.read_text()
 
         # a fenced example at the top: its "# Example" is not the title, and a fenced
         # "## Contents" does not satisfy the rule; a longer closing fence is still a close
         write(ref, "````md\n# Example\n## Contents\n```\nstill inside\n````\n# Real\n" + sections)
         assert ("long.md", "toc") in rules(s)
-        fix_toc(ref, root)
+        fix_toc(ref, s)
         lines = ref.read_text().splitlines()
         # "# Real" is beyond the first 5 lines, so contents go to the top, not inside the fence
         assert lines[1] == "## Contents" and lines[8] == "````md", lines[:10]
         assert ("long.md", "toc") not in rules(s)
         write(ref, "```\n# Example\n```\n# Real\n" + sections)  # real H1 within 5 lines
-        fix_toc(ref, root)
+        fix_toc(ref, s)
         lines = ref.read_text().splitlines()
         assert lines[3] == "# Real" and lines[5] == "## Contents", lines[:7]
 
@@ -518,6 +530,28 @@ def self_test() -> None:
         write(root / "other-root" / "x.md", "# X\n" + sections)
         assert fix_toc(s / "refdir" / "x.md", s).startswith("refused")
         assert fix_toc(original, s).startswith("refused: outside")
+
+        # only reference .md files are eligible
+        write(s / "scripts" / "tool.py", "# x\n" + sections)
+        before = (s / "scripts" / "tool.py").read_text()
+        assert fix_toc(s / "scripts" / "tool.py", s).startswith("refused: not a reference")
+        assert (s / "scripts" / "tool.py").read_text() == before
+        write(s / "SKILL.md", "---\nname: demo\ndescription: d\n---\n# Demo\n" + sections)
+        assert fix_toc(s / "SKILL.md", s).startswith("refused: not a reference")
+        write(s / "notes.txt", "# N\n" + sections)
+        assert fix_toc(s / "notes.txt", s).startswith("refused: not a reference")
+
+        # ".." through a symlinked runtime dir can't reach the original; a symlinked root is refused
+        orig = root / "orig-skill"
+        write(orig / "references" / "long.md", "# L\n" + sections)
+        (orig / ".toolvenv").mkdir()
+        (s / ".toolvenv").symlink_to(orig / ".toolvenv")
+        sneaky = s / ".toolvenv" / ".." / "references" / "long.md"
+        before = (orig / "references" / "long.md").read_text()
+        assert fix_toc(sneaky, s).startswith("refused"), fix_toc(sneaky, s)
+        assert (orig / "references" / "long.md").read_text() == before
+        (root / "linked-root").symlink_to(s)
+        assert fix_toc(root / "linked-root" / "references" / "long.md", root / "linked-root").startswith("refused")
     print("self-test ok")
 
 

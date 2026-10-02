@@ -32,7 +32,7 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("PyYAML is required. Run with the repo virtualenv: .venv/bin/python3 ...") from exc
 
 ALWAYS_EXCLUDED = ("__pycache__", ".DS_Store")  # caches and Finder noise, never content
-RECORD_VERSION = 2  # bump when tree_entries/tree_hash change; older sync hashes then count as foreign
+RECORD_VERSION = 3  # bump when tree_entries/tree_hash change; older sync hashes then count as foreign
 
 
 def vault_root() -> Path:
@@ -44,17 +44,46 @@ def vault_root() -> Path:
     return Path("~/Documents/AI_Workspace/obsidian/knowledge_base").expanduser()
 
 
+def manifest_problem(skill_dir: Path) -> str | None:
+    """Why a skill.yaml that exists can't be read for state declarations (None if fine or absent).
+    An unreadable manifest must not be mistaken for one that declares no runtime state."""
+    manifest = skill_dir / "skill.yaml"
+    if not os.path.lexists(manifest):
+        return None  # genuinely absent: no manifest-declared state (explicit/recorded still apply)
+    if not manifest.is_file():
+        return f"{manifest}: not a regular file (dangling link or directory)"
+    try:
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValueError) as exc:
+        return f"{manifest}: {str(exc).splitlines()[0]}"
+    if not isinstance(data, dict):
+        return f"{manifest}: empty or not a mapping"
+    sec = data.get("security")
+    if not isinstance(sec, dict):
+        return f"{manifest}: security is missing or not a mapping"
+    paths = sec.get("write_paths")
+    if not (isinstance(paths, list) and all(isinstance(x, str) for x in paths)):
+        return f"{manifest}: security.write_paths is missing or not a list of strings"
+    return None
+
+
 def state_paths(skill_dir: Path, identity: Path | None = None) -> set[str]:
+    return _declared(skill_dir, identity)[0]
+
+
+def whole_dir_declared(skill_dir: Path, identity: Path | None = None) -> bool:
+    """True if the manifest declares the entire skill dir writable: runtime files could be
+    anywhere in it, so the protected set can't be inferred."""
+    return _declared(skill_dir, identity)[1]
+
+
+def _declared(skill_dir: Path, identity: Path | None = None) -> tuple[set[str], bool]:
     """Runtime-state paths a skill declares inside its own dir (security.write_paths entries
     under .codex/skills/<name>/), relative to the skill dir. Missing/invalid manifest -> empty."""
-    manifest = skill_dir / "skill.yaml"
-    if not manifest.is_file():
-        return set()
-    try:
-        data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-    except (yaml.YAMLError, ValueError):
-        return set()
-    paths = ((data.get("security") or {}).get("write_paths") or []) if isinstance(data, dict) else []
+    if not os.path.lexists(skill_dir / "skill.yaml") or manifest_problem(skill_dir):
+        return set(), False  # absent, or unusable (callers refuse unless --ignore-bad-manifest)
+    data = yaml.safe_load((skill_dir / "skill.yaml").read_text(encoding="utf-8"))
+    paths = data["security"]["write_paths"]
     # A declared path is runtime state of this skill when it lands inside the skill dir, written
     # either root-relative (".codex/skills/<name>/x", ".agents/skills/<name>/x" — matched on
     # "<parent dir name>/<name>/") or absolute / home-relative.
@@ -63,40 +92,106 @@ def state_paths(skill_dir: Path, identity: Path | None = None) -> set[str]:
     # `identity` = the canonical live dir when reading a baseline/staging copy, so declarations
     # are interpreted for the real target, not for the copy's physical location.
     ident = identity or skill_dir
-    markers = {f".codex/skills/{ident.name}/", f"{ident.parent.name}/{ident.name}/"}
+    markers = {f".codex/skills/{ident.name}", f"{ident.parent.name}/{ident.name}"}  # no trailing slash
     real_dir = str(ident.resolve())
     out: set[str] = set()
+    whole = False
     for entry in paths:
         if not isinstance(entry, str):
             continue
-        entry = os.path.expanduser(entry.strip()).removeprefix("./")
-        hit = next((m for m in markers if not entry.startswith("/")
-                    and (entry.startswith(m) or f"/{m}" in entry)), None)
+        entry = os.path.expanduser(entry).removeprefix("./")  # no strip: quoted names keep spaces
         if entry.startswith("/"):  # absolute: compare after resolving symlinks (/var -> /private/var)
             rel = os.path.relpath(os.path.realpath(entry), real_dir)
-            if rel.startswith(".."):
+            if rel == ".." or rel.startswith("../"):
                 continue
-        elif hit:
-            rel = entry.split(hit, 1)[1]
         else:
-            continue
+            # "/" + normalised path, so ".codex/skills/demo", ".codex/skills/demo/" and
+            # "kb/.codex/skills/demo/x" all match; "../" segments are resolved before matching
+            norm = "/" + os.path.normpath(entry)
+            rel = None
+            for m in markers:
+                if norm.endswith("/" + m):
+                    rel = "."
+                    break
+                at = norm.find("/" + m + "/")
+                if at >= 0:
+                    rel = norm[at + len(m) + 2:]
+                    break
+            if rel is None:
+                continue
         rel = os.path.normpath(rel)
-        if rel not in (".", "") and not rel.startswith(".."):  # never protect the whole dir
+        if rel == ".":
+            whole = True  # the whole skill dir: unresolved scope, never silently "no state"
+        elif rel not in ("", "..") and not rel.startswith("../"):
             out.add(rel)
+    return out, whole
+
+
+def try_lock(vault: Path, name: str):
+    """Exclusive non-blocking lock file under outputs/skill-evals/locks/; None if held elsewhere.
+    The lock is released when the returned file is closed or the process exits."""
+    locks = vault / "outputs" / "skill-evals" / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    f = open(locks / f"{name}.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def write_record(record: Path, data: dict) -> None:
+    """Atomic replace through a uniquely named temp file in the same dir."""
+    record.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=record.parent, prefix=record.name + ".", suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps({"v": RECORD_VERSION, **data}) + "\n")
+    os.replace(tmp, record)
+
+
+def path_key(path: Path) -> str:
+    return hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:8]
+
+
+def state_only_dirs(roots: list[Path], protect: set[str]) -> set[str]:
+    """Ancestor dirs of protected paths that hold no unprotected file or link in any of `roots`.
+    They are left alone for one run (not copied, not compared), so rsync never resets their
+    permissions; they are not persisted, so later real content in them still syncs."""
+    cands = ancestors(protect)
+    def content(root: Path, d: str) -> bool:
+        path = root / d
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            return True  # a type clash is real content, never skipped
+        for dirpath, dirs, names in os.walk(path):  # symlinked dirs appear in `dirs`, unfollowed
+            for n in names + dirs:
+                rel = os.path.relpath(os.path.join(dirpath, n), root)
+                if excluded(rel, protect):
+                    continue
+                is_dir = n in dirs and not os.path.islink(os.path.join(dirpath, n))
+                if not is_dir or rel not in cands:  # files, links and unrelated dirs are content
+                    return True
+        return False
+    return {d for d in cands if not any(content(r, d) for r in roots)}
+
+
+def recorded_protect(skill_dir: Path, vault: Path) -> set[str]:
+    """Protection recorded for this directory by earlier acceptances *and* propagations. Both
+    record kinds are keyed by the same canonical-path key, so a dir that was once accepted into
+    and once synced into keeps the union of both."""
+    key = path_key(skill_dir)
+    out: set[str] = set()
+    for kind in ("accepted", "propagated"):
+        record = vault / "outputs" / "skill-evals" / kind / f"{key}.json"
+        if record.is_file():
+            out |= set(json.loads(record.read_text()).get("protect", []))
     return out
 
 
-def accepted_protect(skill_dir: Path, vault: Path) -> set[str]:
-    """Protection recorded by earlier acceptances of this skill (keyed by canonical path)."""
-    key = hashlib.sha256(str(skill_dir.resolve()).encode()).hexdigest()[:8]
-    record = vault / "outputs" / "skill-evals" / "accepted" / f"{key}.json"
-    return set(json.loads(record.read_text()).get("protect", [])) if record.is_file() else set()
-
-
 def effective_protect(skill_dir: Path, vault: Path, explicit: set[str] = frozenset()) -> set[str]:
-    """Everything that must never be overwritten in this skill dir: declared state, earlier
-    accepted protection, and explicit --protect paths."""
-    return state_paths(skill_dir) | accepted_protect(skill_dir, vault) | {os.path.normpath(e) for e in explicit}
+    """Everything that must never be overwritten in this skill dir: declared state, protection
+    recorded by earlier acceptances or propagations, and explicit --protect paths."""
+    return state_paths(skill_dir) | recorded_protect(skill_dir, vault) | {os.path.normpath(e) for e in explicit}
 
 
 def excluded(rel: str, protect: set[str]) -> bool:
@@ -104,6 +199,15 @@ def excluded(rel: str, protect: set[str]) -> bool:
     if any(p in ALWAYS_EXCLUDED for p in parts):
         return True
     return any(rel == p or rel.startswith(p.rstrip("/") + "/") for p in protect)
+
+
+def ancestors(protect: set[str]) -> set[str]:
+    """All parent dirs of protected paths (relative): possible scaffolding for runtime state."""
+    out = set()
+    for p in protect:
+        parts = p.split("/")[:-1]
+        out |= {"/".join(parts[:i]) for i in range(1, len(parts) + 1)}
+    return out
 
 
 def tree_entries(root: Path, protect: set[str]) -> dict[str, tuple]:
@@ -115,6 +219,7 @@ def tree_entries(root: Path, protect: set[str]) -> dict[str, tuple]:
     out: dict[str, tuple] = {}
     if not root.exists():
         return out
+    scaffolding = ancestors(protect)  # recorded below only if they also hold other content
     for dirpath, dirs, names in os.walk(root):  # does not follow symlinked dirs
         kept = []
         for n in sorted(dirs) + sorted(names):
@@ -127,6 +232,8 @@ def tree_entries(root: Path, protect: set[str]) -> dict[str, tuple]:
                 out[rel] = ("link", os.readlink(p))
             elif stat.S_ISDIR(st.st_mode):
                 kept.append(n)
+                if rel not in scaffolding:  # empty or not, an ordinary dir is compared with its mode
+                    out[rel] = ("dir", st.st_mode & 0o7777)
             else:
                 out[rel] = ("file", st.st_mode & 0o7777, hashlib.sha256(p.read_bytes()).hexdigest())
         dirs[:] = [d for d in dirs if d in kept]
@@ -166,16 +273,54 @@ def outward_links(root: Path, protect: set[str] = frozenset()) -> list[str]:
     return sorted(bad)
 
 
+def linked_state(dirs: list[Path], protect: set[str]) -> list[str]:
+    """Protected paths that are, or pass through, a symlink in any of `dirs`. rsync protects only
+    the logical path, so the file the link resolves to would be unprotected: such skills are
+    refused until the resolved files are protected explicitly."""
+    hits = set()
+    for d in dirs:
+        for p in protect:
+            parts = p.split("/")
+            for i in range(1, len(parts) + 1):
+                if os.path.islink(d / "/".join(parts[:i])):
+                    hits.add(f"{d.name}: {p} (via {'/'.join(parts[:i])})")
+                    break
+    return sorted(hits)
+
+
+def unsupported(protect: set[str]) -> list[str]:
+    """Protected paths whose names rsync filter rules can't match literally across backends
+    (backslash semantics differ, newlines can't be expressed). Such skills are refused."""
+    return sorted(p for p in protect if "\\" in p or "\n" in p)
+
+
 def rsync(src: Path, dest: Path, protect: set[str], dry_run: bool) -> int:
     # --checksum: the default size+mtime quick check skips same-size edits made within one second
-    cmd = ["rsync", "-a", "--checksum", "--delete"]
+    # --no-owner/--no-group: never restore an old owner or group over one changed at the
+    # destination (e.g. a file moved from a shared to a private group)
+    cmd = ["rsync", "-a", "--no-owner", "--no-group", "--checksum", "--delete"]
     cmd += [f"--exclude={p}" for p in ALWAYS_EXCLUDED]
     # anchored; also shields them from --delete. Escape wildcard chars so "state[1].json" stays literal.
-    cmd += ["--exclude=/" + re.sub(r"([*?\[\]\\])", r"\\\1", p) for p in sorted(protect)]
+    cmd += ["--exclude=/" + re.sub(r"([*?\[\]])", r"\\\1", p) for p in sorted(protect)]
     if dry_run:
         cmd += ["--dry-run", "--itemize-changes"]
     cmd += [f"{src}/", f"{dest}/"]
-    return subprocess.run(cmd).returncode
+    # rsync -a copies the source root's mode onto the destination root. The root's permissions
+    # belong to the destination, and neither root may be widened at any moment: during the
+    # transfer the source root takes the intersection of both modes (only ever narrower than
+    # its own), so the destination root is also only narrowed; afterwards both get their own
+    # modes back. A kill mid-transfer leaves roots narrower, never wider.
+    if dry_run or not dest.is_dir():
+        return subprocess.run(cmd).returncode
+    dest_mode = stat.S_IMODE(os.lstat(dest).st_mode)
+    src_mode = stat.S_IMODE(os.lstat(src).st_mode)
+    os.chmod(src, src_mode & dest_mode)
+    try:
+        return subprocess.run(cmd).returncode
+    finally:
+        os.chmod(src, src_mode)
+        if dest.is_dir() and stat.S_IMODE(os.lstat(dest).st_mode) != dest_mode:
+            os.chmod(dest, dest_mode)
 
 
 def single_child(d: Path) -> Path | None:
@@ -184,14 +329,39 @@ def single_child(d: Path) -> Path | None:
 
 
 def accept(run: Path, key: str, live: Path, dry_run: bool, vault: Path,
-           explicit: set[str] = frozenset()) -> int:
+           explicit: set[str] = frozenset(), ignore_bad_manifest: bool = False) -> int:
     live = live.resolve()
     baseline, staging = single_child(run / "baseline" / key), single_child(run / "staging" / key)
     if not (live.is_dir() and baseline and staging):
         print(f"error: need live dir and exactly one baseline/staging dir under {run}/*/{key}", file=sys.stderr)
         return 2
+    if key != path_key(live):
+        print(f"error: key {key} does not match the live path (expected {path_key(live)})", file=sys.stderr)
+        return 2
     if not (baseline.name == staging.name == live.name):
         print(f"error: name mismatch live={live.name} baseline={baseline.name} staging={staging.name}", file=sys.stderr)
+        return 2
+    try:
+        lock = try_lock(vault, key)
+    except OSError as exc:
+        print(f"error: cannot create lock under outputs/skill-evals/locks: {exc}", file=sys.stderr)
+        return 2
+    if lock is None:
+        print(f"busy: another process is accepting {key}", file=sys.stderr)
+        return 3
+    with lock:  # everything below reads and writes protection state under the lock
+        return _accept_locked(key, live, baseline, staging, dry_run, vault, explicit, ignore_bad_manifest)
+
+
+def _accept_locked(key: str, live: Path, baseline: Path, staging: Path, dry_run: bool, vault: Path,
+                   explicit: set[str], ignore_bad_manifest: bool) -> int:
+    bad = [m for m in map(manifest_problem, (live, baseline, staging)) if m]
+    bad += [f"{d}/skill.yaml: declares the whole skill dir writable"
+            for d in (live, baseline, staging) if whole_dir_declared(d, live)]
+    if bad and not ignore_bad_manifest:
+        print(f"error: runtime state can't be inferred: {bad}. Fix the manifest(s), or pass every "
+              f"runtime file with --protect and --ignore-bad-manifest after review. Nothing copied.",
+              file=sys.stderr)
         return 2
     # Protection accepted earlier for this path persists even if a later update stops declaring it;
     # retiring a state path is a separate, explicit decision (delete the record entry by hand).
@@ -199,47 +369,42 @@ def accept(run: Path, key: str, live: Path, dry_run: bool, vault: Path,
     rec_protect = set(json.loads(record.read_text()).get("protect", [])) if record.is_file() else set()
     protect = (effective_protect(live, vault, explicit) | state_paths(baseline, live) | state_paths(staging, live)
                | rec_protect)
-    locks = vault / "outputs" / "skill-evals" / "locks"
-    try:
-        locks.mkdir(parents=True, exist_ok=True)
-        lock = open(locks / f"{key}.lock", "w")
-    except OSError as exc:
-        print(f"error: cannot create lock under {locks}: {exc}", file=sys.stderr)
+    if unsupported(protect):
+        print(f"error: runtime-state names rsync can't protect literally: {unsupported(protect)}; "
+              f"rename them or exclude this skill. Nothing copied.", file=sys.stderr)
         return 2
-    with lock:
+    via_links = linked_state([live, baseline, staging], protect)
+    if via_links and not ignore_bad_manifest:
+        print(f"error: runtime state reached through symlinks: {via_links}. Protect the files the links "
+              f"resolve to with --protect and pass --ignore-bad-manifest after review. Nothing copied.",
+              file=sys.stderr)
+        return 2
+    run_protect = protect | state_only_dirs([live, baseline, staging], protect)
+    drift = tree_diff(live, baseline, run_protect)
+    if drift:
+        print(f"diverged: {live} changed since staging; re-stage and re-review. Paths: {drift[:10]}", file=sys.stderr)
+        return 4
+    print(f"protected runtime state: {sorted(protect) or 'none'}")
+    if not dry_run:  # record first: a later update must never lose this protection
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released when the process exits
-        except BlockingIOError:
-            print(f"busy: another process is accepting {key}", file=sys.stderr)
-            return 3
-        drift = tree_diff(live, baseline, protect)
-        if drift:
-            print(f"diverged: {live} changed since staging; re-stage and re-review. Paths: {drift[:10]}", file=sys.stderr)
-            return 4
-        print(f"protected runtime state: {sorted(protect) or 'none'}")
-        if not dry_run:  # record first: a later update must never lose this protection
-            try:
-                record.parent.mkdir(parents=True, exist_ok=True)
-                tmp = record.with_suffix(".json.tmp")
-                tmp.write_text(json.dumps({"v": RECORD_VERSION, "live": str(live), "protect": sorted(protect)}) + "\n")
-                os.replace(tmp, record)
-            except OSError as exc:
-                print(f"error: cannot record protection at {record}: {exc}; nothing copied", file=sys.stderr)
-                return 2
-        if rsync(staging, live, protect, dry_run) != 0:
-            return 5
-        if dry_run:
-            return 0
-        mismatch = tree_diff(staging, live, protect)
-        if mismatch:
-            print(f"verify failed: {mismatch[:10]}", file=sys.stderr)
-            return 5
+            write_record(record, {"live": str(live), "protect": sorted(protect)})
+        except OSError as exc:
+            print(f"error: cannot record protection at {record}: {exc}; nothing copied", file=sys.stderr)
+            return 2
+    if rsync(staging, live, run_protect, dry_run) != 0:
+        return 5
+    if dry_run:
+        return 0
+    mismatch = tree_diff(staging, live, run_protect)
+    if mismatch:
+        print(f"verify failed: {mismatch[:10]}", file=sys.stderr)
+        return 5
     print(f"accepted: {live}")
     return 0
 
 
 def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_dest: bool = False,
-              explicit: set[str] = frozenset()) -> int:
+              explicit: set[str] = frozenset(), ignore_bad_manifest: bool = False) -> int:
     src = src.resolve()
     if not (src / "SKILL.md").is_file():
         print(f"error: {src} has no SKILL.md", file=sys.stderr)
@@ -248,33 +413,66 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
     if dest.is_symlink():
         print(f"refused: {dest} is a symlink (maintained elsewhere)", file=sys.stderr)
         return 6
+    # One lock for the source (shared with acceptance, so the source can't change mid-sync) and one
+    # for the destination, held from reading the record until the final record is written.
+    try:
+        src_lock = try_lock(vault, path_key(src))
+        dest_lock = try_lock(vault, path_key(dest)) if src_lock else None  # same namespace as accept
+    except OSError as exc:
+        print(f"error: cannot create lock under outputs/skill-evals/locks: {exc}", file=sys.stderr)
+        return 2
+    if src_lock is None or dest_lock is None:
+        if src_lock:
+            src_lock.close()
+        print(f"busy: another accept/propagate holds {src} or {dest}", file=sys.stderr)
+        return 3
+    with src_lock, dest_lock:
+        return _propagate_locked(src, dest, dry_run, vault, overwrite_dest, explicit, ignore_bad_manifest)
+
+
+def _propagate_locked(src: Path, dest: Path, dry_run: bool, vault: Path, overwrite_dest: bool,
+                      explicit: set[str], ignore_bad_manifest: bool) -> int:
+    bad = [m for m in map(manifest_problem, (src, dest)) if m]
+    bad += [f"{d}/skill.yaml: declares the whole skill dir writable" for d in (src, dest) if whole_dir_declared(d)]
+    if bad and not ignore_bad_manifest:
+        print(f"error: runtime state can't be inferred: {bad}. Fix the manifest(s), or pass every "
+              f"runtime file with --protect and --ignore-bad-manifest after review. Nothing copied.",
+              file=sys.stderr)
+        return 2
     # The destination is a mirror. A record of our last sync (in the vault) holds the protected set
     # and the destination hash we left behind, so (a) state paths stay protected even after an update
     # stops declaring them, and (b) we refuse when the destination changed outside this script.
-    record = vault / "outputs" / "skill-evals" / "propagated" / (
-        hashlib.sha256(str(dest.resolve()).encode()).hexdigest()[:8] + ".json")
+    record = vault / "outputs" / "skill-evals" / "propagated" / (path_key(dest) + ".json")
     rec = json.loads(record.read_text()) if record.is_file() else {}
     rec_protect = set(rec.get("protect", []))
-    protect = effective_protect(src, vault, explicit) | state_paths(dest) | rec_protect
+    protect = effective_protect(src, vault, explicit) | effective_protect(dest, vault) | rec_protect
     print(f"protected runtime state: {sorted(protect) or 'none'}")
-    if dest.exists() and tree_diff(src, dest, protect):
+    if unsupported(protect):
+        print(f"error: runtime-state names rsync can't protect literally: {unsupported(protect)}; "
+              f"nothing copied.", file=sys.stderr)
+        return 2
+    via_links = linked_state([src, dest], protect)
+    if via_links and not ignore_bad_manifest:
+        print(f"error: runtime state reached through symlinks: {via_links}. Protect the files the links "
+              f"resolve to with --protect and pass --ignore-bad-manifest after review. Nothing copied.",
+              file=sys.stderr)
+        return 2
+    run_protect = protect | state_only_dirs([src, dest], protect)
+    if dest.exists() and tree_diff(src, dest, run_protect):
         foreign = (not rec or rec.get("v") != RECORD_VERSION
                    or rec.get("hash") != tree_hash(dest, rec_protect))
         if foreign and not overwrite_dest:
             print(f"refused: {dest} has changes not made by a previous propagation "
                   f"({'modified since last sync' if rec else 'never synced by this script'}). "
-                  f"Differing paths: {tree_diff(src, dest, protect)[:10]}. Reconcile them into the vault "
+                  f"Differing paths: {tree_diff(src, dest, run_protect)[:10]}. Reconcile them into the vault "
                   f"copy first, or rerun with --overwrite-dest after the user confirms.", file=sys.stderr)
             return 7
     if dry_run and not dest.exists():
         print(f"would create {dest} with {sum(e[0] == 'file' for e in tree_entries(src, protect).values())} file(s)")
         return 0
+
     def save(hash_: str | None) -> None:
-        record.parent.mkdir(parents=True, exist_ok=True)
-        tmp = record.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"v": RECORD_VERSION, "dest": str(dest), "protect": sorted(protect),
-                                   "hash": hash_}) + "\n")
-        os.replace(tmp, record)
+        write_record(record, {"dest": str(dest), "protect": sorted(protect), "hash": hash_})
 
     if not dry_run:
         try:  # protection first, keeping the previous sync hash until this copy is verified
@@ -282,12 +480,14 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
         except OSError as exc:
             print(f"error: cannot record protection at {record}: {exc}; nothing copied", file=sys.stderr)
             return 2
-        dest.mkdir(parents=True, exist_ok=True)
-    if rsync(src, dest, protect, dry_run) != 0:
+        if not dest.exists():  # a new mirror is never broader than the source root
+            dest.mkdir(parents=True)
+            os.chmod(dest, stat.S_IMODE(os.lstat(src).st_mode))
+    if rsync(src, dest, run_protect, dry_run) != 0:
         return 5
     if dry_run:
         return 0
-    mismatch = tree_diff(src, dest, protect)
+    mismatch = tree_diff(src, dest, run_protect)
     if mismatch:
         print(f"verify failed: {mismatch[:10]}", file=sys.stderr)
         return 5
@@ -311,34 +511,35 @@ def self_test() -> None:
         write(live / "SKILL.md", "old\n")
         write(live / "skill.yaml", manifest("last_run.json"))
         write(live / "last_run.json", "LIVE")
+        k1 = path_key(live)
         for kind in ("baseline", "staging"):
-            dst = run / kind / "k1" / "demo"
-            subprocess.run(["cp", "-R", f"{live}/.", str(dst) + "/"] if dst.mkdir(parents=True) is None else [])
-        write(run / "staging" / "k1" / "demo" / "SKILL.md", "new\n")
-        write(run / "staging" / "k1" / "demo" / "last_run.json", "STALE")
+            dst = run / kind / k1 / "demo"
+            subprocess.run(["cp", "-Rp", f"{live}/.", str(dst) + "/"] if dst.mkdir(parents=True) is None else [])
+        write(run / "staging" / k1 / "demo" / "SKILL.md", "new\n")
+        write(run / "staging" / k1 / "demo" / "last_run.json", "STALE")
 
         assert state_paths(live) == {"last_run.json"}
         assert not (vault / "outputs").exists()
         # accept: content updated, runtime state preserved, locks/ parent created
-        assert accept(run, "k1", live, False, vault) == 0
+        assert accept(run, k1, live, False, vault) == 0
         assert (live / "SKILL.md").read_text() == "new\n"
         assert (live / "last_run.json").read_text() == "LIVE"
         assert (vault / "outputs" / "skill-evals" / "locks").is_dir()
 
         # diverged: live changed after baseline -> exit 4, nothing written
         write(live / "SKILL.md", "edited elsewhere\n")
-        assert accept(run, "k1", live, False, vault) == 4
+        assert accept(run, k1, live, False, vault) == 4
         assert (live / "SKILL.md").read_text() == "edited elsewhere\n"
 
         # busy: another process holds the lock -> exit 3
         write(live / "SKILL.md", "old\n")  # back to baseline content
-        lockfile = vault / "outputs" / "skill-evals" / "locks" / "k1.lock"
+        lockfile = vault / "outputs" / "skill-evals" / "locks" / f"{k1}.lock"
         holder = subprocess.Popen([sys.executable, "-c",
             "import fcntl,sys,time;f=open(sys.argv[1],'w');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(30)",
             str(lockfile)], stdout=subprocess.PIPE, text=True)
         try:
             assert holder.stdout.readline().strip() == "held"
-            assert accept(run, "k1", live, False, vault) == 3
+            assert accept(run, k1, live, False, vault) == 3
         finally:
             holder.kill()
             holder.wait()
@@ -395,7 +596,7 @@ def self_test() -> None:
             for kind in ("baseline", "staging"):
                 dst = run_dir / kind / key / skill.name
                 dst.mkdir(parents=True)
-                subprocess.run(["cp", "-R", f"{skill}/.", f"{dst}/"], check=True)
+                subprocess.run(["cp", "-Rp", f"{skill}/.", f"{dst}/"], check=True)
             return run_dir / "staging" / key / skill.name
 
         # exec-bit change on the live copy after staging is drift
@@ -404,22 +605,22 @@ def self_test() -> None:
         write(live2 / "run.sh", "echo hi\n")
         write(live2 / "skill.yaml", manifest("last_run.json").replace("demo", "demo2"))
         write(live2 / "last_run.json", "STATE")
-        st = stage(t / "run2", "k2", live2)
+        st = stage(t / "run2", path_key(live2), live2)
         os.chmod(live2 / "run.sh", 0o755)
-        assert accept(t / "run2", "k2", live2, False, vault) == 4
+        assert accept(t / "run2", path_key(live2), live2, False, vault) == 4
         os.chmod(live2 / "run.sh", 0o644)
-        assert accept(t / "run2", "k2", live2, False, vault) == 0  # records protect {last_run.json}
+        assert accept(t / "run2", path_key(live2), live2, False, vault) == 0  # records protect {last_run.json}
 
         # later updates that stop declaring the state path still preserve it
-        st = stage(t / "run3", "k2", live2)
+        st = stage(t / "run3", path_key(live2), live2)
         write(st / "skill.yaml", "name: demo2\nsecurity:\n  write_paths: ['outputs/']\n")
         write(st / "last_run.json", "STAGED-STALE")
-        assert accept(t / "run3", "k2", live2, False, vault) == 0
+        assert accept(t / "run3", path_key(live2), live2, False, vault) == 0
         assert (live2 / "last_run.json").read_text() == "STATE"
-        st = stage(t / "run4", "k2", live2)  # no manifest declares it any more
+        st = stage(t / "run4", path_key(live2), live2)  # no manifest declares it any more
         (st / "last_run.json").unlink()
         write(st / "SKILL.md", "v2\n")
-        assert accept(t / "run4", "k2", live2, False, vault) == 0
+        assert accept(t / "run4", path_key(live2), live2, False, vault) == 0
         assert (live2 / "last_run.json").read_text() == "STATE" and (live2 / "SKILL.md").read_text() == "v2\n"
 
         # state paths written for other roots or as absolute paths are recognised
@@ -451,13 +652,13 @@ def self_test() -> None:
         write(live5 / "cache.json", "LIVE-CACHE")
         write(live5 / "state[1].json", "LIVE-S1")
         write(live5 / "state1.json", "content, replaced by staging\n")
-        st = stage(t / "run5", "k5", live5)
+        st = stage(t / "run5", path_key(live5), live5)
         (st / "cache.json").unlink()
         write(st / "state[1].json", "STALE")
         write(st / "skill.yaml", "name: demo5\nsecurity:\n  write_paths: ['outputs/', "
               f"'{live5.resolve()}/cache.json', '.codex/skills/demo5/state[1].json']\n")
         write(st / "state1.json", "new content\n")
-        assert accept(t / "run5", "k5", live5, False, vault) == 0
+        assert accept(t / "run5", path_key(live5), live5, False, vault) == 0
         assert (live5 / "cache.json").read_text() == "LIVE-CACHE"
         assert (live5 / "state[1].json").read_text() == "LIVE-S1"
         assert (live5 / "state1.json").read_text() == "new content\n"
@@ -466,21 +667,21 @@ def self_test() -> None:
         live6 = vault / ".codex" / "skills" / "demo6"
         write(live6 / "SKILL.md", "a\n")
         write(live6 / "skill.yaml", "name: demo6\nsecurity:\n  write_paths: ['.codex/skills/demo6/cache/state.json']\n")
-        st = stage(t / "run6", "k6", live6)
+        st = stage(t / "run6", path_key(live6), live6)
         write(st / "SKILL.md", "b\n")
         write(live6 / "cache" / "state.json", "RUNTIME")
-        assert accept(t / "run6", "k6", live6, False, vault) == 0
+        assert accept(t / "run6", path_key(live6), live6, False, vault) == 0
         assert (live6 / "cache" / "state.json").read_text() == "RUNTIME" and (live6 / "SKILL.md").read_text() == "b\n"
 
         # if the protection record cannot be written, nothing is copied
         accepted_dir = vault / "outputs" / "skill-evals" / "accepted"
-        st = stage(t / "run7", "k7", live6)
+        st = stage(t / "run7", path_key(live6), live6)
         write(st / "SKILL.md", "c\n")
         saved = t / "accepted-saved"
         accepted_dir.rename(saved)
         accepted_dir.write_text("not a directory")
         try:
-            assert accept(t / "run7", "k7", live6, False, vault) == 2
+            assert accept(t / "run7", path_key(live6), live6, False, vault) == 2
             assert (live6 / "SKILL.md").read_text() == "b\n"
         finally:
             accepted_dir.unlink()
@@ -488,9 +689,9 @@ def self_test() -> None:
 
         # a permission change on a content directory after staging is drift
         write(live6 / "references" / "r.md", "r\n")
-        st = stage(t / "run8", "k8", live6)
+        st = stage(t / "run8", path_key(live6), live6)
         os.chmod(live6 / "references", 0o700)
-        assert accept(t / "run8", "k8", live6, False, vault) == 4
+        assert accept(t / "run8", path_key(live6), live6, False, vault) == 4
         os.chmod(live6 / "references", 0o755)
 
         # propagation records protection before copying: if recording fails nothing is copied
@@ -508,9 +709,9 @@ def self_test() -> None:
             saved.rename(prop_dir)
 
         # full permission bits count: 0644 -> 0600 on a content file after staging is drift
-        st = stage(t / "run9", "k9", live6)
+        st = stage(t / "run9", path_key(live6), live6)
         os.chmod(live6 / "SKILL.md", 0o600)
-        assert accept(t / "run9", "k9", live6, False, vault) == 4
+        assert accept(t / "run9", path_key(live6), live6, False, vault) == 4
         os.chmod(live6 / "SKILL.md", 0o644)
 
         # a sync record from an older format is not trusted (fails safe), its protection is kept
@@ -535,6 +736,250 @@ def self_test() -> None:
         (lk / "venv" / "python").symlink_to("/usr/bin/python3")
         assert outward_links(lk) == ["abs.md -> /etc/hosts", "esc.md -> ../outside.md", "venv/python -> /usr/bin/python3"]
         assert outward_links(lk, {"venv"}) == ["abs.md -> /etc/hosts", "esc.md -> ../outside.md"]
+
+        # a runtime-state name with a backslash can't be protected literally: refuse, copy nothing
+        live10 = vault / ".codex" / "skills" / "demo10"
+        write(live10 / "SKILL.md", "a\n")
+        state_name = "state" + chr(92) + "run.json"  # one literal backslash
+        write(live10 / "skill.yaml", "name: demo10\nsecurity:\n  write_paths: ['.codex/skills/demo10/"
+              + state_name + "']\n")
+        write(live10 / state_name, "LIVE")
+        assert state_paths(live10) == {state_name}, state_paths(live10)
+        st = stage(t / "run10", path_key(live10), live10)
+        write(st / "SKILL.md", "b\n")
+        assert accept(t / "run10", path_key(live10), live10, False, vault) == 2
+        assert (live10 / "SKILL.md").read_text() == "a\n" and (live10 / state_name).read_text() == "LIVE"
+        assert propagate(live10, dest_root, False, vault, overwrite_dest=True) == 2
+
+        # permissions of a dir that only holds protected state are left alone (not reset by rsync)
+        live11 = vault / ".codex" / "skills" / "demo11"
+        write(live11 / "SKILL.md", "a\n")
+        write(live11 / "skill.yaml", "name: demo11\nsecurity:\n  write_paths: ['.codex/skills/demo11/cache/state.json']\n")
+        write(live11 / "cache" / "state.json", "S")
+        st = stage(t / "run11", path_key(live11), live11)
+        write(st / "SKILL.md", "b\n")
+        os.chmod(live11 / "cache", 0o700)
+        assert accept(t / "run11", path_key(live11), live11, False, vault) == 0
+        assert stat.S_IMODE(os.stat(live11 / "cache").st_mode) == 0o700
+        assert (live11 / "SKILL.md").read_text() == "b\n"
+
+        # an unreadable destination manifest means unknown runtime state: refuse unless reviewed
+        write(dest_root / "demo11" / "skill.yaml", "a: [unclosed\n")
+        write(dest_root / "demo11" / "keep.db", "DB")
+        assert propagate(live11, dest_root, False, vault, overwrite_dest=True) == 2
+        assert (dest_root / "demo11" / "keep.db").read_text() == "DB"
+        assert propagate(live11, dest_root, False, vault, overwrite_dest=True, explicit={"keep.db"},
+                         ignore_bad_manifest=True) == 0
+        assert (dest_root / "demo11" / "keep.db").read_text() == "DB"
+
+        # a concurrent propagation to the same destination holds its lock: busy (exit 3)
+        lockfile = vault / "outputs" / "skill-evals" / "locks" / (path_key(dest_root / "demo11") + ".lock")
+        holder = subprocess.Popen([sys.executable, "-c",
+            "import fcntl,sys,time;f=open(sys.argv[1],'w');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(30)",
+            str(lockfile)], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            assert propagate(live11, dest_root, False, vault) == 3
+        finally:
+            holder.kill()
+            holder.wait()
+
+        # malformed state declarations count as unknown state, like an unparsable manifest
+        for bad_yaml in ("", "name: demo11\nsecurity: 'oops'\n",
+                         "name: demo11\nsecurity:\n  write_paths: '.codex/skills/demo11/keep.db'\n"):
+            write(dest_root / "demo11" / "skill.yaml", bad_yaml)
+            assert manifest_problem(dest_root / "demo11"), repr(bad_yaml)
+            assert propagate(live11, dest_root, False, vault, overwrite_dest=True) == 2
+            assert (dest_root / "demo11" / "keep.db").read_text() == "DB"
+
+        # an unprotected symlinked dir next to protected state makes the parent real content
+        sod = t / "sod"
+        write(sod / "cache" / "state.json", "S")
+        (sod / "assets").mkdir()
+        assert state_only_dirs([sod], {"cache/state.json"}) == {"cache"}
+        (sod / "cache" / "assets").symlink_to("../assets")
+        assert state_only_dirs([sod], {"cache/state.json"}) == set()
+
+        # the destination root keeps its own permissions (rsync -a would copy the source root's)
+        st = stage(t / "run12", path_key(live11), live11)
+        write(st / "SKILL.md", "c\n")
+        os.chmod(live11, 0o700)
+        assert accept(t / "run12", path_key(live11), live11, False, vault) == 0
+        assert stat.S_IMODE(os.stat(live11).st_mode) == 0o700
+        os.chmod(live11, 0o755)
+
+        # an existing manifest must declare security.write_paths; odd manifest entries are errors
+        d13 = dest_root / "demo11"
+        for setup in ("missing-security", "dangling", "directory"):
+            m = d13 / "skill.yaml"
+            if m.is_dir() and not m.is_symlink():
+                m.rmdir()
+            elif os.path.lexists(m):
+                m.unlink()
+            if setup == "missing-security":
+                write(m, "name: demo11\n")
+            elif setup == "dangling":
+                m.symlink_to("nowhere.yaml")
+            else:
+                m.mkdir()
+            assert manifest_problem(d13), setup
+            assert propagate(live11, dest_root, False, vault, overwrite_dest=True) == 2, setup
+            assert (d13 / "keep.db").read_text() == "DB"
+        (d13 / "skill.yaml").rmdir()
+
+        # the reviewed override works even when the manifest can't be parsed into state
+        write(d13 / "skill.yaml", "name: demo11\nsecurity: 'oops'\n")
+        assert state_paths(d13) == set()
+        assert propagate(live11, dest_root, False, vault, overwrite_dest=True, explicit={"keep.db"},
+                         ignore_bad_manifest=True) == 0
+        assert (d13 / "keep.db").read_text() == "DB"
+
+        # empty ordinary dirs count: their mode is compared, and they are content for state_only_dirs
+        write(live11 / "assets" / "private" / ".keep", "")
+        (live11 / "assets" / "private" / ".keep").unlink()
+        st = stage(t / "run13", path_key(live11), live11)
+        os.chmod(live11 / "assets" / "private", 0o700)
+        assert accept(t / "run13", path_key(live11), live11, False, vault) == 4
+        os.chmod(live11 / "assets" / "private", 0o755)
+        (sod / "cache" / "assets").unlink()
+        assert state_only_dirs([sod], {"cache/state.json"}) == {"cache"}
+        (sod / "cache" / "new-empty-dir").mkdir()
+        assert state_only_dirs([sod], {"cache/state.json"}) == set()
+
+        # protection recorded by an acceptance into the destination dir survives a later sync there
+        inst = dest_root / "demo14"
+        write(inst / "SKILL.md", "v1\n")
+        write(inst / "skill.yaml", "name: demo14\nsecurity:\n  write_paths: ['.codex/skills/demo14/last_run.json']\n")
+        write(inst / "last_run.json", "INSTALLED-STATE")
+        st = stage(t / "run14", path_key(inst), inst)
+        write(st / "skill.yaml", "name: demo14\nsecurity:\n  write_paths: ['outputs/']\n")  # stops declaring it
+        (st / "last_run.json").unlink()
+        assert accept(t / "run14", path_key(inst), inst, False, vault) == 0  # accepted into ~/.claude-like root
+        src14 = vault / ".codex" / "skills" / "demo14"
+        write(src14 / "SKILL.md", "v2\n")
+        write(src14 / "skill.yaml", "name: demo14\nsecurity:\n  write_paths: ['outputs/']\n")
+        assert propagate(src14, dest_root, False, vault, overwrite_dest=True) == 0
+        assert (inst / "last_run.json").read_text() == "INSTALLED-STATE"
+
+        # acceptance and propagation share one lock namespace; a mismatched key is refused
+        holder = subprocess.Popen([sys.executable, "-c",
+            "import fcntl,sys,time;f=open(sys.argv[1],'w');fcntl.flock(f,fcntl.LOCK_EX);print('held',flush=True);time.sleep(30)",
+            str(vault / "outputs" / "skill-evals" / "locks" / (path_key(inst) + ".lock"))], stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            assert propagate(src14, dest_root, False, vault) == 3  # an accept into inst holds this lock
+        finally:
+            holder.kill()
+            holder.wait()
+        st = stage(t / "run15", path_key(inst), inst)
+        assert accept(t / "run15", path_key(inst), inst, False, vault) == 0
+        stage(t / "run16", "deadbeef", inst)
+        assert accept(t / "run16", "deadbeef", inst, False, vault) == 2
+
+        # "..state.json" is a file inside the skill, not a traversal; quoted spaces are kept
+        live17 = vault / ".codex" / "skills" / "demo17"
+        write(live17 / "SKILL.md", "a\n")
+        write(live17 / "skill.yaml", "name: demo17\nsecurity:\n  write_paths: ['.codex/skills/demo17/..state.json', "
+              "'.codex/skills/demo17/ padded.json', '.codex/skills/demo17/../escape.json']\n")
+        write(live17 / "..state.json", "S1")
+        write(live17 / " padded.json", "S2")
+        assert state_paths(live17) == {"..state.json", " padded.json"}, state_paths(live17)
+        st = stage(t / "run17", path_key(live17), live17)
+        (st / "..state.json").unlink()
+        (st / " padded.json").unlink()
+        write(st / "SKILL.md", "b\n")
+        assert accept(t / "run17", path_key(live17), live17, False, vault) == 0
+        assert (live17 / "..state.json").read_text() == "S1" and (live17 / " padded.json").read_text() == "S2"
+
+        # copies made with cp -Rp keep modes: a 0664 file is not false drift under umask 022
+        old_umask = os.umask(0o022)
+        try:
+            write(live17 / "group.md", "g\n")
+            os.chmod(live17 / "group.md", 0o664)
+            st = stage(t / "run18", path_key(live17), live17)
+            assert stat.S_IMODE(os.stat(st / "group.md").st_mode) == 0o664
+            assert accept(t / "run18", path_key(live17), live17, False, vault) == 0
+        finally:
+            os.umask(old_umask)
+
+        # declaring the whole skill dir writable is unresolved scope: refuse unless reviewed
+        live19 = vault / ".codex" / "skills" / "demo19"
+        write(live19 / "SKILL.md", "a\n")
+        write(live19 / "skill.yaml", "name: demo19\nsecurity:\n  write_paths: ['.codex/skills/demo19/']\n")
+        write(live19 / "state.db", "A")
+        assert whole_dir_declared(live19) and state_paths(live19) == set()
+        st = stage(t / "run19", path_key(live19), live19)
+        write(st / "state.db", "B")
+        assert accept(t / "run19", path_key(live19), live19, False, vault) == 2
+        assert (live19 / "state.db").read_text() == "A"
+        assert accept(t / "run19", path_key(live19), live19, False, vault, explicit={"state.db"},
+                      ignore_bad_manifest=True) == 0
+        assert (live19 / "state.db").read_text() == "A"
+        assert propagate(live19, dest_root, False, vault) == 2
+
+        # every spelling of the whole skill dir is unresolved scope
+        for spelling in (".codex/skills/demo19", "./.codex/skills/demo19/", "kb/.codex/skills/demo19",
+                         ".codex/skills/demo19/sub/..", str(live19)):
+            write(live19 / "skill.yaml", f"name: demo19\nsecurity:\n  write_paths: ['{spelling}']\n")
+            assert whole_dir_declared(live19) and state_paths(live19) == set(), spelling
+        write(live19 / "skill.yaml", "name: demo19\nsecurity:\n  write_paths: ['.codex/skills/demo19x/a', "
+              "'.codex/skills/demo19/../other/a', 'kb/.codex/skills/demo19/cache/x.json']\n")
+        assert not whole_dir_declared(live19) and state_paths(live19) == {"cache/x.json"}, state_paths(live19)
+
+        # the destination root is never widened; the source root's mode is restored afterwards
+        a20, b20 = t / "a20", t / "b20"
+        write(a20 / "f.txt", "new\n")
+        write(b20 / "f.txt", "old\n")
+        os.chmod(a20, 0o755)
+        os.chmod(b20, 0o700)
+        assert rsync(a20, b20, set(), False) == 0
+        assert stat.S_IMODE(os.stat(b20).st_mode) == 0o700 and stat.S_IMODE(os.stat(a20).st_mode) == 0o755
+        assert (b20 / "f.txt").read_text() == "new\n"
+
+        # neither root is ever wider than its own mode while rsync runs; owner/group not copied
+        seen = []
+        real_run = subprocess.run
+        def watching_run(cmd, *a, **k):
+            seen.append((stat.S_IMODE(os.stat(a20).st_mode), stat.S_IMODE(os.stat(b20).st_mode), list(cmd)))
+            return real_run(cmd, *a, **k)
+        for src_m, dest_m in ((0o700, 0o755), (0o755, 0o700), (0o750, 0o705)):
+            os.chmod(a20, src_m)
+            os.chmod(b20, dest_m)
+            subprocess.run = watching_run
+            try:
+                assert rsync(a20, b20, set(), False) == 0
+            finally:
+                subprocess.run = real_run
+            during_src, during_dest, cmd = seen[-1]
+            assert during_src & ~src_m == 0 and during_dest & ~dest_m == 0, (oct(during_src), oct(during_dest))
+            assert stat.S_IMODE(os.stat(a20).st_mode) == src_m and stat.S_IMODE(os.stat(b20).st_mode) == dest_m
+            assert "--no-owner" in cmd and "--no-group" in cmd
+
+        # a newly created destination takes the source root's (restrictive) mode
+        src22 = vault / ".codex" / "skills" / "demo22"
+        write(src22 / "SKILL.md", "private\n")
+        write(src22 / "skill.yaml", "name: demo22\nsecurity:\n  write_paths: ['outputs/']\n")
+        os.chmod(src22, 0o700)
+        assert propagate(src22, dest_root, False, vault) == 0
+        assert stat.S_IMODE(os.stat(dest_root / "demo22").st_mode) == 0o700
+        os.chmod(src22, 0o755)
+
+        # declared state reached through an internal symlink: refuse unless the target is protected
+        live21 = vault / ".codex" / "skills" / "demo21"
+        write(live21 / "SKILL.md", "a\n")
+        write(live21 / "skill.yaml", "name: demo21\nsecurity:\n  write_paths: ['.codex/skills/demo21/cache/state.json']\n")
+        write(live21 / "data" / "state.json", "LIVE-STATE")
+        (live21 / "cache").symlink_to("data")
+        st = stage(t / "run21", path_key(live21), live21)
+        write(st / "data" / "state.json", "STAGED")
+        write(st / "SKILL.md", "b\n")
+        assert linked_state([live21], {"cache/state.json"})
+        assert accept(t / "run21", path_key(live21), live21, False, vault) == 2
+        assert (live21 / "data" / "state.json").read_text() == "LIVE-STATE"
+        assert accept(t / "run21", path_key(live21), live21, False, vault, explicit={"data/state.json"},
+                      ignore_bad_manifest=True) == 0
+        assert (live21 / "data" / "state.json").read_text() == "LIVE-STATE" and (live21 / "SKILL.md").read_text() == "b\n"
+        assert propagate(live21, dest_root, False, vault) == 2
     print("self-test ok")
 
 
@@ -546,6 +991,8 @@ def main() -> int:
     ap.add_argument("--propagate", type=Path, metavar="SKILL_DIR")
     ap.add_argument("--dest-root", type=Path, default=Path("~/.claude/skills"))
     ap.add_argument("--state-paths", type=Path, metavar="SKILL_DIR")
+    ap.add_argument("--same", nargs=2, type=Path, metavar=("LIVE", "COPY"),
+                    help="exit 0 if COPY equals LIVE (types, modes, links, content), protected state ignored")
     ap.add_argument("--check-links", type=Path, metavar="DIR",
                     help="list symlinks that are absolute or leave DIR (exit 1 if any)")
     ap.add_argument("--identity", type=Path, metavar="LIVE_DIR",
@@ -553,12 +1000,20 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--protect", action="append", default=[], metavar="REL_PATH",
                     help="extra runtime-state path (relative to the skill dir) to never overwrite; repeatable")
+    ap.add_argument("--ignore-bad-manifest", action="store_true",
+                    help="proceed although a skill.yaml can't be read; only after the user reviewed --protect")
     ap.add_argument("--overwrite-dest", action="store_true", help="propagate even if the destination has foreign changes (user-confirmed)")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
         self_test()
         return 0
+    if a.same:
+        live_dir, copy_dir = a.same
+        protect = effective_protect(live_dir.resolve(), vault_root(), set(a.protect))
+        diff = tree_diff(live_dir, copy_dir, protect | state_only_dirs([live_dir, copy_dir], protect))
+        print("\n".join(diff) if diff else "same")
+        return 1 if diff else 0
     if a.check_links:
         ident = a.identity.resolve() if a.identity else None
         protect = (state_paths(a.check_links, ident) | (effective_protect(ident, vault_root(), set(a.protect))
@@ -570,9 +1025,11 @@ def main() -> int:
         print("\n".join(sorted(effective_protect(a.state_paths.resolve(), vault_root(), set(a.protect)))))
         return 0
     if a.propagate:
-        return propagate(a.propagate, a.dest_root, a.dry_run, vault_root(), a.overwrite_dest, set(a.protect))
+        return propagate(a.propagate, a.dest_root, a.dry_run, vault_root(), a.overwrite_dest, set(a.protect),
+                         a.ignore_bad_manifest)
     if a.run and a.key and a.live:
-        return accept(a.run.resolve(), a.key, a.live, a.dry_run, vault_root(), set(a.protect))
+        return accept(a.run.resolve(), a.key, a.live, a.dry_run, vault_root(), set(a.protect),
+                      a.ignore_bad_manifest)
     ap.error("give --run/--key/--live, --propagate, --state-paths or --self-test")
     return 2
 
