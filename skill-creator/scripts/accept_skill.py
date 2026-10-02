@@ -270,8 +270,10 @@ def tree_entries(root: Path, protect: set[str]) -> dict[str, tuple]:
                 kept.append(n)
                 if rel not in scaffolding:  # empty or not, an ordinary dir is compared with its mode
                     out[rel] = ("dir", st.st_mode & 0o7777)
-            else:
+            elif stat.S_ISREG(st.st_mode):
                 out[rel] = ("file", st.st_mode & 0o7777, hashlib.sha256(p.read_bytes()).hexdigest())
+            else:  # fifo, socket, device: reading could block or fail; never copied or compared
+                raise ValueError(f"unsupported entry type (not file/dir/symlink): {p}")
         dirs[:] = [d for d in dirs if d in kept]
     for rel in list(out):
         parent = os.path.dirname(rel)
@@ -353,10 +355,71 @@ def linked_state(dirs: list[Path], protect: set[str]) -> list[str]:
     return sorted(hits)
 
 
+def special_entries(dirs: list[Path], protect: set[str]) -> list[str]:
+    """Unprotected entries that are not regular files, dirs or symlinks (fifos, sockets, devices)."""
+    out = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for dirpath, dnames, fnames in os.walk(d):
+            for n in dnames + fnames:
+                f = os.path.join(dirpath, n)
+                rel = os.path.relpath(f, d)
+                mode = os.lstat(f).st_mode
+                if not excluded(rel, protect) and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                    out.append(f"{d.name}: {rel}")
+            dnames[:] = [x for x in dnames if not excluded(os.path.relpath(os.path.join(dirpath, x), d), protect)]
+    return sorted(out)
+
+
 def unsupported(protect: set[str]) -> list[str]:
     """Protected paths whose names rsync filter rules can't match literally across backends
     (backslash semantics differ, newlines can't be expressed). Such skills are refused."""
     return sorted(p for p in protect if "\\" in p or "\n" in p)
+
+
+def review(live: Path, staging: Path, protect: set[str]) -> list[str]:
+    """Everything acceptance would change, protected state excluded: added/removed entries, type,
+    mode and symlink-target changes, and a unified diff for changed text files."""
+    import difflib
+    run_protect = protect | state_only_dirs([live, staging], protect)
+    a, b = tree_entries(live, run_protect), tree_entries(staging, run_protect)
+    out = []
+
+    def text_diff(rel: str, old_file: bool, new_file: bool) -> str:
+        """Unified diff of a file's text; a side that isn't a regular file counts as empty."""
+        try:
+            la = (live / rel).read_text(encoding="utf-8").splitlines(keepends=True) if old_file else []
+            lb = (staging / rel).read_text(encoding="utf-8").splitlines(keepends=True) if new_file else []
+        except UnicodeDecodeError:
+            return f"binary content: {rel}"
+        return "".join(difflib.unified_diff(la, lb, f"live/{rel}", f"staging/{rel}")).rstrip("\n")
+
+    for rel in sorted(a.keys() | b.keys()):
+        old, new = a.get(rel), b.get(rel)
+        if old == new:
+            continue
+        if old is None or new is None:
+            entry = new or old
+            out.append(f"{'added' if old is None else 'removed'}: {rel} ({entry[0]}"
+                       + (f", mode {oct(entry[1])})" if entry[0] in ("file", "dir") else f" -> {entry[1]})"))
+            if entry[0] == "file":  # show the whole text that appears or disappears
+                out.append(text_diff(rel, old is not None, new is not None))
+            continue
+        if old[0] != new[0]:
+            out.append(f"type changed: {rel} {old[0]} -> {new[0]}")
+            if "file" in (old[0], new[0]):
+                out.append(text_diff(rel, old[0] == "file", new[0] == "file"))
+        elif old[0] == "link":
+            out.append(f"symlink target: {rel} {old[1]} -> {new[1]}")
+        elif old[0] == "dir":
+            out.append(f"mode: {rel}/ {oct(old[1])} -> {oct(new[1])}")
+        else:
+            if old[1] != new[1]:
+                out.append(f"mode: {rel} {oct(old[1])} -> {oct(new[1])}")
+            if old[2] != new[2]:
+                out.append(text_diff(rel, True, True))
+    return out
 
 
 def rsync(src: Path, dest: Path, protect: set[str], dry_run: bool) -> int:
@@ -442,6 +505,11 @@ def _accept_locked(key: str, live: Path, baseline: Path, staging: Path, dry_run:
         print(f"error: runtime-state names rsync can't protect literally: {unsupported(protect)}; "
               f"rename them or exclude this skill. Nothing copied.", file=sys.stderr)
         return 2
+    specials = special_entries([live, baseline, staging], protect)
+    if specials:
+        print(f"error: unsupported entries (fifo/socket/device) can't be compared or copied: {specials}. "
+              f"Remove them or protect them with --protect. Nothing copied.", file=sys.stderr)
+        return 2
     via_links = linked_state([live, baseline, staging], protect)
     if via_links and not ignore_bad_manifest:
         print(f"error: runtime state reached through symlinks: {via_links}. Protect the files the links "
@@ -483,6 +551,10 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
               file=sys.stderr)
         return 2
     dest = dest_root.expanduser() / src.name
+    real_dest = Path(os.path.realpath(dest))
+    if real_dest == src or src in real_dest.parents or real_dest in src.parents:
+        print(f"error: source {src} and destination {dest} overlap; nothing created or copied", file=sys.stderr)
+        return 2
     if dest.is_symlink():
         print(f"refused: {dest} is a symlink (maintained elsewhere)", file=sys.stderr)
         return 6
@@ -528,6 +600,11 @@ def _propagate_locked(src: Path, dest: Path, dry_run: bool, vault: Path, overwri
     if unsupported(protect):
         print(f"error: runtime-state names rsync can't protect literally: {unsupported(protect)}; "
               f"nothing copied.", file=sys.stderr)
+        return 2
+    specials = special_entries([src, dest], protect)
+    if specials:
+        print(f"error: unsupported entries (fifo/socket/device) can't be compared or copied: {specials}. "
+              f"Remove them or protect them with --protect. Nothing copied.", file=sys.stderr)
         return 2
     via_links = linked_state([src, dest], protect)
     if via_links and not ignore_bad_manifest:
@@ -1116,6 +1193,48 @@ def self_test() -> None:
         write(live28 / "skill.yaml", "name: demo28\nsecurity:\n  write_paths: ['" + str(live28) + "/x/../state.json']\n")
         assert whole_dir_declared(live28)
 
+        # overlapping source/destination trees are refused before anything is created
+        assert propagate(src27, src27 / "test-install", False, vault) == 2
+        assert not (src27 / "test-install").exists()
+        assert propagate(src27, src27.parent, False, vault) == 2
+
+        # review shows mode and symlink-target changes that a text diff would hide; state excluded
+        rv_live, rv_st = t / "rv" / "live", t / "rv" / "staging"
+        for d_ in (rv_live, rv_st):
+            write(d_ / "a.txt", "same\n")
+            write(d_ / "b.txt", "x\n")
+            write(d_ / "c.txt", "x\n")
+            write(d_ / "state.json", "S" if d_ == rv_live else "STALE")
+        os.chmod(rv_live / "a.txt", 0o600)
+        os.chmod(rv_st / "a.txt", 0o644)
+        (rv_live / "ln").symlink_to("b.txt")
+        (rv_st / "ln").symlink_to("c.txt")
+        write(rv_st / "a.txt", "same\nnew line\n")
+        changes = "\n".join(review(rv_live, rv_st, {"state.json"}))
+        assert "mode: a.txt 0o600 -> 0o644" in changes and "symlink target: ln b.txt -> c.txt" in changes
+        assert "+new line" in changes and "state.json" not in changes
+        write(rv_st / "evals" / "trigger.json", '[{"query": "q1", "should_trigger": true}]\n')
+        (rv_live / "b.txt").unlink()
+        (rv_st / "b.txt").unlink()
+        write(rv_live / "gone.py", "print('old')\n")
+        changes = "\n".join(review(rv_live, rv_st, {"state.json"}))
+        assert "added: evals/trigger.json (file" in changes and '+[{"query": "q1"' in changes
+        assert "removed: gone.py (file" in changes and "-print('old')" in changes
+
+        # a named pipe would block a read: refused before anything is recorded or copied
+        live29 = vault / ".codex" / "skills" / "demo29"
+        write(live29 / "SKILL.md", "a\n")
+        write(live29 / "skill.yaml", "name: demo29\nsecurity:\n  write_paths: ['outputs/']\n")
+        st = stage(t / "run29", path_key(live29), live29)
+        write(st / "SKILL.md", "b\n")
+        os.mkfifo(live29 / "events.fifo")
+        assert special_entries([live29], set()) == ["demo29: events.fifo"]
+        assert accept(t / "run29", path_key(live29), live29, False, vault) == 2
+        assert (live29 / "SKILL.md").read_text() == "a\n"
+        assert not (vault / "outputs" / "skill-evals" / "accepted" / f"{path_key(live29)}.json").exists()
+        assert propagate(live29, dest_root, False, vault) == 2 and not (dest_root / "demo29").exists()
+        assert special_entries([live29], {"events.fifo"}) == []
+
         # a newly created destination takes the source root's (restrictive) mode
         src22 = vault / ".codex" / "skills" / "demo22"
         write(src22 / "SKILL.md", "private\n")
@@ -1173,6 +1292,8 @@ def main() -> int:
     ap.add_argument("--propagate", type=Path, metavar="SKILL_DIR")
     ap.add_argument("--dest-root", type=Path, default=Path("~/.claude/skills"))
     ap.add_argument("--state-paths", type=Path, metavar="SKILL_DIR")
+    ap.add_argument("--review", nargs=2, type=Path, metavar=("LIVE", "STAGING"),
+                    help="print every change acceptance would apply (content, modes, links), protected state excluded")
     ap.add_argument("--same", nargs=2, type=Path, metavar=("LIVE", "COPY"),
                     help="exit 0 if COPY equals LIVE (types, modes, links, content), protected state ignored")
     ap.add_argument("--check-links", type=Path, metavar="DIR",
@@ -1190,10 +1311,24 @@ def main() -> int:
     if a.self_test:
         self_test()
         return 0
+    if a.review:
+        live_dir, staging_dir = a.review
+        protect = effective_protect(live_dir.resolve(), vault_root(), set(a.protect)) | state_paths(staging_dir, live_dir.resolve())
+        try:
+            changes = review(live_dir, staging_dir, protect)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print("\n".join(changes) if changes else "no changes")
+        return 0
     if a.same:
         live_dir, copy_dir = a.same
         protect = effective_protect(live_dir.resolve(), vault_root(), set(a.protect))
-        diff = tree_diff(live_dir, copy_dir, protect | state_only_dirs([live_dir, copy_dir], protect))
+        try:
+            diff = tree_diff(live_dir, copy_dir, protect | state_only_dirs([live_dir, copy_dir], protect))
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print("\n".join(diff) if diff else "same")
         return 1 if diff else 0
     if a.check_links:

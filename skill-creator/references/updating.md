@@ -24,8 +24,10 @@ Dry-run is the default. Apply only after the user has approved the dry-run repor
 1. Create the run dir and record the printed absolute path. Shell variables don't survive between
    tool calls, so write the path out literally wherever `$R` appears below:
    `mkdir -p outputs/skill-evals && R=$(mktemp -d "$PWD/outputs/skill-evals/batch-XXXXXX") && echo "$R"`
-2. Targets: explicit skill dirs, or every skill under a root (`PY SC/scripts/lint_skill.py --root DIR`
-   lists them and skips symlinks and `synced`). For each target:
+2. Targets: explicit skill dirs, or every skill under a root:
+   `PY SC/scripts/lint_skill.py --list-root DIR` prints the canonical path of each skill (symlinks
+   and `synced` skipped), whether or not it has lint findings. Build `targets.tsv` from this list,
+   never from lint output (clean skills print no findings). For each target:
    - Canonical path = `realpath`. Drop duplicates.
    - `key` = first 8 hex chars of sha256(canonical path), e.g.
      `python3 -c "import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:8])" <path>`.
@@ -72,9 +74,12 @@ Dry-run is the default. Apply only after the user has approved the dry-run repor
    - In Claude Code you may run one subagent per skill. Each subagent touches only its own staging
      dir and returns a summary. The coordinator runs T1/T2 and touches any shared file itself, one
      at a time. In Codex, run the skills one after another.
-4. **Consolidated review**: add the results table to `$R/report.md`, plus the diff command for each
-   skill: `diff -ru <canonical path> $R/staging/<key>/<name>`. The user accepts or rejects each
-   skill.
+4. **Consolidated review**: add the results table to `$R/report.md` and, for each skill, the output
+   of `PY SC/scripts/accept_skill.py --review <canonical path> $R/staging/<key>/<name>`. It lists
+   every change acceptance would apply, using the same comparison as acceptance: added and removed
+   files, mode changes, symlink-target changes, and a unified diff for text files. Protected
+   runtime state is excluded. A plain `diff -ru` hides mode and link changes, so don't rely on it.
+   The user accepts or rejects each skill.
 5. **Accept, then propagate**: see the next sections.
 
 ## Test tiers
@@ -91,7 +96,9 @@ when instructions or scripts changed.
 of them `false` near-misses). Verified in the 2026-10-01 pilot:
 1. Create a disposable dir: `T=$(mktemp -d) && mkdir -p "$T/.claude/commands" "$T/bin" && echo "$T"`.
    Write `$T/override.json` with
-   `{"skillOverrides": {"<name>": "off"}, "disableSkillShellExecution": true}`.
+   `{"skillOverrides": {"<name>": "off"}, "disableSkillShellExecution": true, "disableAllHooks": true}`,
+   and `$T/no-mcp.json`
+   with `{"mcpServers": {}}`.
    Then create a `claude` shim that injects it. Run the block without the list indentation, because
    the closing `EOF` must start its line:
    ```bash
@@ -99,7 +106,7 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
    #!/bin/bash
    echo "\${*//\$'\n'/ }" >> "$T/calls.log"
    exec > >(tee -a "$T/stdout.log") 2>>"$T/stderr.log" < /dev/null
-   exec "$(command -v claude)" --settings "$T/override.json" "\$@"
+   exec "$(command -v claude)" --settings "$T/override.json" --tools Skill,Read --strict-mcp-config --mcp-config "$T/no-mcp.json" "\$@"
    EOF
    chmod +x "$T/bin/claude"
    ```
@@ -108,6 +115,12 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
    - its stream-json stdout in `stdout.log`;
    - its stderr in `stderr.log`.
 
+   Every call gets only the Skill and Read tools, no MCP server and no hooks, so no trigger-test
+   call can run a command, write a file or call a service, even before the runner stops it.
+   `disableAllHooks` matters: a user Stop hook would otherwise run on every call. T1 keeps the
+   default setting sources, so your real skills compete as they do in normal use; with no write
+   tools, inherited permissions don't matter here. Managed (enterprise) hooks can't be disabled
+   this way, so if managed settings exist, report T1 as not isolated.
    The official runner throws all of these away. Stdin comes from `/dev/null`, so claude prints
    no "no stdin" warning. `exec` keeps the PID, so the runner can still stop the call.
    Use the shim because `skillOverrides` in a project settings file does **not** hide user-level
@@ -117,9 +130,9 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
 3. Visibility probe. It calls the real `claude` with the override, **not** the shim: the shim
    points stdin at `/dev/null`, and the probe sends its prompt on stdin.
    - Run from `$T`:
-     `printf '%s' 'Answer only YES or NO: is a skill named <name> listed among the skills available to you? Do not invoke anything.' | env -u CLAUDECODE claude -p --tools Skill --settings "$T/override.json"`.
+     `printf '%s' 'Answer only YES or NO: is a skill named <name> listed among the skills available to you? Do not invoke anything.' | env -u CLAUDECODE claude -p --tools Skill --strict-mcp-config --mcp-config "$T/no-mcp.json" --settings "$T/override.json"`.
    - Control: run the same command from a second fresh temp dir with
-     `--settings '{"disableSkillShellExecution": true}'`.
+     `--settings '{"disableSkillShellExecution": true, "disableAllHooks": true}'`.
    - Hiding is verified only if control = YES and probe = NO. Anything else makes T1
      **inconclusive**: report it and do not score.
    - `--tools Skill` keeps the skill list visible while removing every tool that could act. Shell
@@ -136,6 +149,7 @@ of them `false` near-misses). Verified in the 2026-10-01 pilot:
    `PY SC/scripts/t1_check.py "$T" "$R/tests/<key>/trigger.json"` must exit 0 and print `valid`.
    It requires that:
    - the number of calls equals the expected queries × runs;
+   - every call ran with only Skill and Read and no MCP server (read from each call's init event);
    - every call reached a decision by the runner's own rules (another tool chosen, a Skill/Read
      block completed or naming the runner's stub, or a clean result);
    - for every query, the trigger count rebuilt from the logs equals the runner's count (the
@@ -184,7 +198,19 @@ missing, or `claude` is not on PATH, report T1 as unavailable.
   - Before launching, check that no symlink under `$W` is absolute or resolves outside `$W`, dangling
     ones included: `PY SC/scripts/accept_skill.py --check-links "$W"` must exit 0.
     Otherwise T2 is invalid.
-  - Run with cwd = `$W` and `KB_ROOT=$W`. Use the T1 shim pattern with `skillOverrides` set to
+  - Launch each case with its own command. Don't use the T1 shim, which allows only Skill and Read,
+    so file-producing cases could never finish:
+    `cd "$W" && printf '%s' "<prompt>" | env -u CLAUDECODE KB_ROOT="$W" claude -p --setting-sources local --tools Read,Write,Edit,Glob,Grep --strict-mcp-config --mcp-config <empty mcp config> --settings '{"disableSkillShellExecution": true, "disableAllHooks": true}' --permission-mode acceptEdits --output-format stream-json --verbose > <log>`.
+    - `--setting-sources local` (with no local settings in `$W`) drops your user and project
+      settings: no inherited permission rules or `additionalDirectories` can widen writes, and no
+      user skills load, so installed copies can't stand in for the candidate. The candidate is
+      read by its absolute path.
+    - There is no Bash tool and no MCP server.
+    - Writes are confined to `$W`: in headless mode, Claude Code only writes inside its working
+      directory, and writes elsewhere are denied. With hooks off, nothing runs on Stop. Both were
+      checked live on 2026-10-02: a user Stop hook did not fire, and a write to a sibling
+      directory was denied.
+    - A skill whose cases need more tools is unsafe, and needs the user's go-ahead. Use the T1 shim pattern with `skillOverrides` set to
     `"off"` for the target **and** every skill in the dependency closure, so that only the copies in
     `$W` can be used.
   - The prompt names `$W/.codex/skills/<name>/SKILL.md` by absolute path. Record that file's sha256.
@@ -228,6 +254,7 @@ Acceptance is a fragile operation, so a script does it:
   `PY SC/scripts/accept_skill.py --propagate <vault skill dir> --dry-run`, show the preview, then
   run it again without `--dry-run`.
   - It refuses a symlinked destination (exit 6).
+  - It refuses a source and destination that are the same tree or nest inside each other (exit 2).
   - It holds the source's lock (shared with acceptance) and a destination lock for the whole sync
     (exit 3 = busy). The same unreadable-manifest rule applies.
   - It protects the union of the source state paths, the destination state paths, and every path

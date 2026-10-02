@@ -560,6 +560,8 @@ def main() -> int:
     ap.add_argument("skill_dirs", nargs="*", type=Path)
     ap.add_argument("--all", action="store_true", help="same as --root .codex/skills (cwd = vault root)")
     ap.add_argument("--root", type=Path, help="lint every DIR/*/ with a SKILL.md (skips symlinks, synced)")
+    ap.add_argument("--list-root", type=Path, metavar="DIR",
+                    help="print the canonical path of every skill under DIR (the batch targets), then exit")
     ap.add_argument("--upload", action="store_true", help="enforce claude.ai/API upload frontmatter spec")
     ap.add_argument("--fix-toc", nargs="+", type=Path, metavar="FILE", help="insert contents lists, then exit")
     ap.add_argument("--within", type=Path, help="with --fix-toc: only edit files inside this dir (default: cwd)")
@@ -568,6 +570,10 @@ def main() -> int:
     args = ap.parse_args()
     if args.self_test:
         self_test()
+        return 0
+    if args.list_root:
+        for d in skill_dirs(args.list_root):
+            print(os.path.realpath(d))
         return 0
     if args.fix_toc:
         results = [(f, fix_toc(f, args.within)) for f in args.fix_toc]

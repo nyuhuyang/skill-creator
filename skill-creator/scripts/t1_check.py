@@ -12,7 +12,8 @@ trigger; a truncated name is not enough), because the runner waits
 for those arguments. Any error result makes the call undecided. A run is valid only if
 the number of calls equals the expected queries x runs from the runner's results, every call was
 decided, stderr holds nothing but known-benign warnings, and the trigger outcomes reconstructed
-from the logs match the runner's per-query trigger counts. The runner can drop the last chunk of
+from the logs match the runner's per-query trigger counts, and every call ran with only the
+Skill and Read tools and no MCP server (so no call could act on anything). The runner can drop the last chunk of
 a stream when the process exits, so a mismatch is possible and makes the run inconclusive.
 calls.log holds one line per call with the call's arguments (the query is among them).
 
@@ -117,8 +118,10 @@ def check(t: Path, results: Path) -> bool:
         return False
     errors = [l for l in read("stderr.log") if l.strip() and not any(b in l for b in BENIGN_STDERR)]
     undecided = [i + 1 for i, s in enumerate(segs) if not decided(s, skill_name)]
+    unrestricted = [i + 1 for i, s in enumerate(segs)
+                    if not s or set(s[0].get("tools") or ["?"]) - {"Skill", "Read"} or s[0].get("mcp_servers")]
     print(f"expected={expected} calls={calls} streams={len(segs)} undecided={undecided or 'none'} "
-          f"stderr_errors={len(errors)}")
+          f"stderr_errors={len(errors)} unrestricted={unrestricted or 'none'}")
     for e in errors[:5]:
         print(f"  stderr: {e[:200]}")
     # map each logged call to its query (longest query text contained in the call's arguments)
@@ -135,14 +138,14 @@ def check(t: Path, results: Path) -> bool:
     if unmapped or mismatched:
         print(f"  unmapped calls={unmapped}; runner vs log trigger counts differ for: {mismatched or 'none'}")
     ok = (expected > 0 and calls == len(segs) == expected and not undecided and not errors
-          and not unmapped and not mismatched)
+          and not unmapped and not mismatched and not unrestricted)
     print("valid" if ok else "INCONCLUSIVE: do not score this T1 run")
     return ok
 
 
 def self_test() -> None:
     ev = lambda **kw: json.dumps(kw)
-    init = ev(type="system", subtype="init")
+    init = ev(type="system", subtype="init", tools=["Read", "Skill"], mcp_servers=[])
     start = lambda name: ev(type="stream_event", event={"type": "content_block_start",
                                                          "content_block": {"type": "tool_use", "name": name}})
     stop = ev(type="stream_event", event={"type": "content_block_stop"})
@@ -177,6 +180,18 @@ def self_test() -> None:
             (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
                 {"query": "the query", "runs": runs, "triggers": trig}]}))
             assert check(t, t / "results.json") is expect, name
+
+    # a call that had Bash or an MCP server available is inconclusive, whatever it decided
+    for loose in (ev(type="system", subtype="init", tools=["Read", "Skill", "Bash"], mcp_servers=[]),
+                  ev(type="system", subtype="init", tools=["Read", "Skill"], mcp_servers=[{"name": "x"}])):
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp)
+            (t / "calls.log").write_text("-p q1\n")
+            (t / "stdout.log").write_text("\n".join([loose, start("Bash")]) + "\n")
+            (t / "stderr.log").write_text("")
+            (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
+                {"query": "q1", "runs": 1, "triggers": 0}]}))
+            assert check(t, t / "results.json") is False
 
     # the runner recorded "not triggered" although the log shows a full stub selection -> inconclusive
     with tempfile.TemporaryDirectory() as tmp:
