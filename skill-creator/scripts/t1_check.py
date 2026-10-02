@@ -13,7 +13,8 @@ for those arguments. Any error result makes the call undecided. A run is valid o
 the number of calls equals the expected queries x runs from the runner's results, every call was
 decided, stderr holds nothing but known-benign warnings, and the trigger outcomes reconstructed
 from the logs match the runner's per-query trigger counts, and every call ran with only the
-Skill and Read tools and no MCP server (so no call could act on anything). The runner can drop the last chunk of
+Skill and Read tools and no MCP server, and no hook ran (no "hook_*" system event anywhere in
+the stream, whatever source -- user, plugin, managed, server -- defined it). The runner can drop the last chunk of
 a stream when the process exits, so a mismatch is possible and makes the run inconclusive.
 calls.log holds one line per call with the call's arguments (the query is among them).
 
@@ -118,10 +119,11 @@ def check(t: Path, results: Path) -> bool:
         return False
     errors = [l for l in read("stderr.log") if l.strip() and not any(b in l for b in BENIGN_STDERR)]
     undecided = [i + 1 for i, s in enumerate(segs) if not decided(s, skill_name)]
+    hook_events = sum(1 for line in read("stdout.log") if '"subtype":"hook_' in line.replace(" ", ""))
     unrestricted = [i + 1 for i, s in enumerate(segs)
                     if not s or set(s[0].get("tools") or ["?"]) - {"Skill", "Read"} or s[0].get("mcp_servers")]
     print(f"expected={expected} calls={calls} streams={len(segs)} undecided={undecided or 'none'} "
-          f"stderr_errors={len(errors)} unrestricted={unrestricted or 'none'}")
+          f"stderr_errors={len(errors)} unrestricted={unrestricted or 'none'} hook_events={hook_events}")
     for e in errors[:5]:
         print(f"  stderr: {e[:200]}")
     # map each logged call to its query (longest query text contained in the call's arguments)
@@ -138,7 +140,7 @@ def check(t: Path, results: Path) -> bool:
     if unmapped or mismatched:
         print(f"  unmapped calls={unmapped}; runner vs log trigger counts differ for: {mismatched or 'none'}")
     ok = (expected > 0 and calls == len(segs) == expected and not undecided and not errors
-          and not unmapped and not mismatched and not unrestricted)
+          and not unmapped and not mismatched and not unrestricted and not hook_events)
     print("valid" if ok else "INCONCLUSIVE: do not score this T1 run")
     return ok
 
@@ -180,6 +182,17 @@ def self_test() -> None:
             (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
                 {"query": "the query", "runs": runs, "triggers": trig}]}))
             assert check(t, t / "results.json") is expect, name
+
+    # a hook that ran (e.g. a managed SessionStart hook before init) makes the run inconclusive
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        (t / "calls.log").write_text("-p q1\n")
+        (t / "stdout.log").write_text("\n".join([ev(type="system", subtype="hook_started", hook_id="h"), init,
+                                                 start("Bash")]) + "\n")
+        (t / "stderr.log").write_text("")
+        (t / "results.json").write_text(json.dumps({"skill_name": "demo", "results": [
+            {"query": "q1", "runs": 1, "triggers": 0}]}))
+        assert check(t, t / "results.json") is False
 
     # a call that had Bash or an MCP server available is inconclusive, whatever it decided
     for loose in (ev(type="system", subtype="init", tools=["Read", "Skill", "Bash"], mcp_servers=[]),

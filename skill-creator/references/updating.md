@@ -84,6 +84,31 @@ Dry-run is the default. Apply only after the user has approved the dry-run repor
 
 ## Test tiers
 
+**Isolation prerequisite (T1 and T2).** Managed policy can define hooks that `disableAllHooks`
+can't turn off. That policy can come from `managed-settings.json`, the drop-ins in
+`managed-settings.d/`, MDM, or a server. Such a hook (for example SessionStart) would run before
+any check could stop it, so isolation must be established **before** a T1 or T2 run, not only
+detected afterwards:
+1. Screen what can be inspected locally:
+   - `/Library/Application Support/ClaudeCode/managed-settings.json` and its `managed-settings.d/*.json`
+     (on Linux, the same files under `/etc/claude-code/`);
+   - on macOS, the MDM preferences under `/Library/Managed Preferences/` (any `com.anthropic.*`
+     plist).
+
+   If anything defines hooks, skip both tiers and report "T1/T2 skipped: managed hooks".
+2. MDM and server-managed policy can't be fully inspected from here. Run T1/T2 only after the user
+   confirms there is none: a personal account and a machine that isn't org-managed. Alternatively
+   the user can provide an isolated environment, such as a separate machine, VM or user account,
+   where a hook's side effects can't reach their data. Ask for this together with the apply-phase
+   approval. Without it, skip T1/T2 and report why.
+- After every run, also check the result itself, as validation: the stream-json
+  log must contain no `"subtype":"hook_*"` system event. Claude Code logs every hook it runs, and
+  the logs were checked to show none when hooks are off. For T1, `t1_check.py` does this check.
+  For T2, `grep -c '"subtype":"hook_' <log>` must print 0, otherwise the case is invalid (not
+  isolated).
+- Unless the user provides a separately isolated environment, a run with hook events never
+  counts. T0 is unaffected.
+
 Always run T0. Run T1 when `description` or `when_to_use` changed, or when the skill is new. Run T2
 when instructions or scripts changed.
 

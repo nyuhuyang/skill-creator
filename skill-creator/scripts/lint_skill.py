@@ -15,6 +15,7 @@ import re
 import sys
 import tempfile
 import os
+import stat
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -75,9 +76,27 @@ def packaged(p: Path, skill_dir: Path) -> bool:
     return parts[0] != "evals" and not VENDOR_DIRS & set(parts)
 
 
+def scan_md(skill_dir: Path) -> tuple[list[Path], list[str]]:
+    """Every *.md entry under the skill (symlinked dirs not followed) and the directories that
+    couldn't be listed. Hidden dirs, node_modules, __pycache__ and the top-level evals/ are
+    pruned (never referenced or packaged), so errors there don't count."""
+    found, errors = [], []
+
+    def onerr(err: OSError) -> None:
+        if not isinstance(err, FileNotFoundError):
+            errors.append(f"{err.filename}: {err.strerror or err}")
+
+    for dirpath, dnames, fnames in os.walk(skill_dir, onerror=onerr):
+        found += [Path(dirpath) / n for n in fnames + dnames if n.endswith(".md")]
+        top = Path(dirpath) == skill_dir
+        dnames[:] = [d for d in dnames if not d.startswith(".") and d not in ("node_modules", "__pycache__")
+                     and not (top and d == "evals") and not os.path.islink(os.path.join(dirpath, d))]
+    return sorted(found), errors
+
+
 def reference_files(skill_dir: Path) -> list[Path]:
     return sorted(
-        p for p in skill_dir.rglob("*.md")
+        p for p in scan_md(skill_dir)[0]
         if p.name != "SKILL.md"
         and packaged(p, skill_dir)
         and p.relative_to(skill_dir).parts[0] not in SKIP_DIRS
@@ -109,6 +128,21 @@ def direct_mentions(skill_md: str, skill_dir: Path) -> set[Path]:
     return found
 
 
+def read_regular(path: Path) -> tuple[list[str], str | None]:
+    """Lines of a regular text file, or (no lines, reason). A FIFO, socket, device or directory
+    is never opened (opening a FIFO would block)."""
+    try:
+        mode = os.stat(path).st_mode  # follows a symlink to its target
+    except OSError as exc:
+        return [], f"cannot stat: {exc.strerror or exc}"
+    if not stat.S_ISREG(mode):
+        return [], "not a regular file (fifo/socket/device/directory); not opened"
+    try:
+        return path.read_text(encoding="utf-8").splitlines(), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return [], f"cannot read as UTF-8 text: {exc}"
+
+
 def lint(skill_dir: Path, upload: bool = False) -> list[tuple[str, int, str, str, str]]:
     findings: list[tuple[str, int, str, str, str]] = []
 
@@ -116,10 +150,14 @@ def lint(skill_dir: Path, upload: bool = False) -> list[tuple[str, int, str, str
         findings.append((str(path), line, sev, rule, msg))
 
     skill_md_path = skill_dir / "SKILL.md"
-    if not skill_md_path.is_file():
+    if not os.path.lexists(skill_md_path):
         add(skill_dir, 0, "error", "skill-md", "SKILL.md missing")
         return findings
-    text = skill_md_path.read_text(encoding="utf-8")
+    md_lines, why = read_regular(skill_md_path)
+    if why:
+        add(skill_md_path, 1, "error", "unreadable", why)
+        return findings
+    text = "\n".join(md_lines) + "\n"
     fm, body_start, err = split_frontmatter(text)
     if err:
         add(skill_md_path, 1, "error", "frontmatter", err)
@@ -147,7 +185,8 @@ def lint(skill_dir: Path, upload: bool = False) -> list[tuple[str, int, str, str
     elif upload and name != skill_dir.name:
         add(skill_md_path, 1, "error", "name", f"upload spec requires name {name!r} == directory {skill_dir.name!r}")
     if upload:  # claude.ai / Skills API accept exactly one SKILL.md per package
-        for extra in sorted(p for p in skill_dir.rglob("SKILL.md") if p != skill_md_path and packaged(p, skill_dir)):
+        for extra in sorted(p for p in scan_md(skill_dir)[0]
+                            if p.name == "SKILL.md" and p != skill_md_path and packaged(p, skill_dir)):
             add(extra, 1, "error", "nested-skill-md", "upload spec allows only the root SKILL.md")
     desc = fm.get("description")
     if not err and (not isinstance(desc, str) or not desc.strip()):
@@ -186,10 +225,15 @@ def lint(skill_dir: Path, upload: bool = False) -> list[tuple[str, int, str, str
         add(skill_md_path, body_start + 1, "error", "body-length",
             f"SKILL.md body {body_lines} lines > {MAX_BODY_LINES}")
 
+    for err in scan_md(skill_dir)[1]:  # an unlistable dir would hide references: never "clean"
+        add(skill_dir, 0, "error", "unreadable-dir", err)
     refs = reference_files(skill_dir)
     mentioned = direct_mentions(text, skill_dir)
     for ref in refs:
-        lines = ref.read_text(encoding="utf-8").splitlines()
+        lines, why = read_regular(ref)
+        if why:
+            add(ref, 1, "error", "unreadable", why)
+            continue
         if len(lines) > TOC_THRESHOLD and not has_contents(lines, 0, TOC_WINDOW):
             add(ref, 1, "error", "toc",
                 f"{len(lines)} lines with no contents heading in first {TOC_WINDOW} lines")
@@ -272,6 +316,9 @@ def fix_toc(path: Path, within: Path | None = None) -> str:
             or any(part.startswith(".") for part in rel.parts)
             or {"node_modules", "__pycache__"} & set(rel.parts)):
         return "refused: not a reference .md file (SKILL.md, scripts/, assets/, evals/ and non-.md are never edited)"
+    _, why = read_regular(path)
+    if why:
+        return f"refused: {why}"
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     if len(lines) <= TOC_THRESHOLD:
         return "skip: not over 100 lines"
@@ -306,7 +353,10 @@ def fix_toc(path: Path, within: Path | None = None) -> str:
 
 def trigger_text(skill_dir: Path) -> str:
     """What Claude Code lists for triggering: description, plus when_to_use if present."""
-    fm, _, err = split_frontmatter((skill_dir / "SKILL.md").read_text(encoding="utf-8"))
+    md_lines, why = read_regular(skill_dir / "SKILL.md")
+    if why:
+        return ""
+    fm, _, err = split_frontmatter("\n".join(md_lines) + "\n")
     if err or not fm:
         return ""
     parts = [fm.get("description"), fm.get("when_to_use")]
@@ -541,6 +591,35 @@ def self_test() -> None:
         write(s / "notes.txt", "# N\n" + sections)
         assert fix_toc(s / "notes.txt", s).startswith("refused: not a reference")
 
+        # non-regular or unreadable .md entries are reported, never opened, and don't stop the run
+        fifo = s / "references" / "events.md"
+        os.mkfifo(fifo)
+        (s / "references" / "folder.md").mkdir()
+        (s / "references" / "binary.md").write_bytes(b"\xff\xfe\x00bad")
+        got = [(Path(f[0]).name, f[3]) for f in lint(s) if f[2] == "error"]
+        for name in ("events.md", "folder.md", "binary.md"):
+            assert (name, "unreadable") in got, (name, got)
+        assert fix_toc(fifo, s).startswith("refused: not a regular file")
+        fifo.unlink()
+        (s / "references" / "folder.md").rmdir()
+        (s / "references" / "binary.md").unlink()
+
+        # an unlistable references/ dir is an error, not a silently clean result
+        write(s / "references" / "hidden-guide.md", "x\n")
+        os.chmod(s / "references", 0o111)
+        try:
+            assert ("demo", "unreadable-dir") in [(Path(f[0]).name, f[3]) for f in lint(s)]
+        finally:
+            os.chmod(s / "references", 0o755)
+        (s / "references" / "hidden-guide.md").unlink()
+
+        # an undecodable SKILL.md is a finding, and trigger-text reports it instead of crashing
+        bad = root / "other-root" / "badmd"
+        bad.mkdir(parents=True)
+        (bad / "SKILL.md").write_bytes(b"---\nname: badmd\n\xff\xfe\n---\n")
+        assert [f[3] for f in lint(bad)] == ["unreadable"]
+        assert trigger_text(bad) == ""
+
         # ".." through a symlinked runtime dir can't reach the original; a symlinked root is refused
         orig = root / "orig-skill"
         write(orig / "references" / "long.md", "# L\n" + sections)
@@ -583,7 +662,8 @@ def main() -> int:
     if args.trigger_text:
         text = trigger_text(args.trigger_text)
         if not text:
-            print(f"error: no description in {args.trigger_text}/SKILL.md", file=sys.stderr)
+            _, why = read_regular(args.trigger_text / "SKILL.md")
+            print(f"error: {why or 'no description'} in {args.trigger_text}/SKILL.md", file=sys.stderr)
             return 1
         print(text)
         return 0
@@ -593,7 +673,11 @@ def main() -> int:
         ap.error("give skill dirs, --root DIR or --all")
     errors = 0
     for d in targets:
-        for path, line, sev, rule, msg in lint(d, args.upload):
+        try:
+            results = lint(d, args.upload)
+        except Exception as exc:  # one broken skill must not hide the rest of the batch
+            results = [(str(d), 0, "error", "lint-crash", f"{type(exc).__name__}: {exc}")]
+        for path, line, sev, rule, msg in results:
             errors += sev == "error"
             print(f"{path}:{line} {sev} {rule} {msg}")
     return 1 if errors else 0

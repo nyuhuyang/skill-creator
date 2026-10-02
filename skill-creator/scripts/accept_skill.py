@@ -194,7 +194,7 @@ def state_only_dirs(roots: list[Path], protect: set[str]) -> set[str]:
         path = root / d
         if path.is_symlink() or (path.exists() and not path.is_dir()):
             return True  # a type clash is real content, never skipped
-        for dirpath, dirs, names in os.walk(path):  # symlinked dirs appear in `dirs`, unfollowed
+        for dirpath, dirs, names in walk(path):  # symlinked dirs appear in `dirs`, unfollowed
             for n in names + dirs:
                 rel = os.path.relpath(os.path.join(dirpath, n), root)
                 if excluded(rel, protect):
@@ -230,6 +230,18 @@ def effective_protect(skill_dir: Path, vault: Path, explicit: set[str] = frozens
     return state_paths(skill_dir) | recorded_protect(skill_dir, vault) | {os.path.normpath(e) for e in explicit}
 
 
+def _walk_error(err: OSError) -> None:
+    if isinstance(err, FileNotFoundError):
+        return  # absent (or vanished) dir: nothing to inspect, not an error
+    raise ValueError(f"cannot read directory {err.filename}: {err.strerror or err}")
+
+
+def walk(root):
+    """os.walk that never follows symlinked dirs and raises ValueError instead of silently
+    skipping a directory it can't list (an unreadable dir would otherwise look 'equal')."""
+    return os.walk(root, onerror=_walk_error)
+
+
 def excluded(rel: str, protect: set[str]) -> bool:
     parts = rel.split("/")
     if any(p in ALWAYS_EXCLUDED for p in parts):
@@ -256,7 +268,7 @@ def tree_entries(root: Path, protect: set[str]) -> dict[str, tuple]:
     if not root.exists():
         return out
     scaffolding = ancestors(protect)  # recorded below only if they also hold other content
-    for dirpath, dirs, names in os.walk(root):  # does not follow symlinked dirs
+    for dirpath, dirs, names in walk(root):  # does not follow symlinked dirs
         kept = []
         for n in sorted(dirs) + sorted(names):
             p = Path(dirpath) / n
@@ -298,14 +310,14 @@ def outward_links(root: Path, protect: set[str] = frozenset()) -> list[str]:
     dangling ones included. Edits through such links would change files outside the copy."""
     real_root = os.path.realpath(root)
     bad = []
-    for dirpath, dirs, names in os.walk(root):
+    for dirpath, dirs, names in walk(root):
         for n in dirs + names:
             p = os.path.join(dirpath, n)
             rel = os.path.relpath(p, root)
             if os.path.islink(p) and not excluded(rel, protect):
                 target = os.readlink(p)
                 resolved = os.path.realpath(p)
-                if os.path.isabs(target) or not resolved.startswith(real_root + os.sep):
+                if os.path.isabs(target) or not (resolved == real_root or resolved.startswith(real_root + os.sep)):
                     bad.append(f"{rel} -> {target}")
         dirs[:] = [d for d in dirs if not excluded(os.path.relpath(os.path.join(dirpath, d), root), protect)]
     return sorted(bad)
@@ -329,7 +341,7 @@ def linked_state(dirs: list[Path], protect: set[str]) -> list[str]:
                     break
             base = d / p
             if base.is_dir() and not base.is_symlink():
-                for dirpath, dnames, fnames in os.walk(base):  # links in dnames are not followed
+                for dirpath, dnames, fnames in walk(base):  # links in dnames are not followed
                     for n in dnames + fnames:
                         link = os.path.join(dirpath, n)
                         if not os.path.islink(link):
@@ -341,7 +353,7 @@ def linked_state(dirs: list[Path], protect: set[str]) -> list[str]:
         # mode changed when rsync updates the unprotected name
         protected_inodes, shared = {}, []
         if d.is_dir():
-            for dirpath, dnames, fnames in os.walk(d):
+            for dirpath, dnames, fnames in walk(d):
                 for n in fnames:
                     f = os.path.join(dirpath, n)
                     st = os.lstat(f)
@@ -361,7 +373,7 @@ def special_entries(dirs: list[Path], protect: set[str]) -> list[str]:
     for d in dirs:
         if not d.is_dir():
             continue
-        for dirpath, dnames, fnames in os.walk(d):
+        for dirpath, dnames, fnames in walk(d):
             for n in dnames + fnames:
                 f = os.path.join(dirpath, n)
                 rel = os.path.relpath(f, d)
@@ -482,7 +494,11 @@ def accept(run: Path, key: str, live: Path, dry_run: bool, vault: Path,
         print(f"busy: another process is accepting {key}", file=sys.stderr)
         return 3
     with lock:  # everything below reads and writes protection state under the lock
-        return _accept_locked(key, live, baseline, staging, dry_run, vault, explicit, ignore_bad_manifest)
+        try:
+            return _accept_locked(key, live, baseline, staging, dry_run, vault, explicit, ignore_bad_manifest)
+        except ValueError as exc:
+            print(f"error: {exc}; can't inspect the trees safely. Fix permissions and retry.", file=sys.stderr)
+            return 2
 
 
 def _accept_locked(key: str, live: Path, baseline: Path, staging: Path, dry_run: bool, vault: Path,
@@ -550,7 +566,8 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
         print(f"error: --protect paths must be clean relative paths inside the skill: {bad_explicit(explicit)}",
               file=sys.stderr)
         return 2
-    dest = dest_root.expanduser() / src.name
+    # absolute local path: a relative "host:dir" would otherwise be read by rsync as a remote target
+    dest = Path(os.path.abspath(dest_root.expanduser())) / src.name
     real_dest = Path(os.path.realpath(dest))
     if real_dest == src or src in real_dest.parents or real_dest in src.parents:
         print(f"error: source {src} and destination {dest} overlap; nothing created or copied", file=sys.stderr)
@@ -572,7 +589,11 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
         print(f"busy: another accept/propagate holds {src} or {dest}", file=sys.stderr)
         return 3
     with src_lock, dest_lock:
-        return _propagate_locked(src, dest, dry_run, vault, overwrite_dest, explicit, ignore_bad_manifest)
+        try:
+            return _propagate_locked(src, dest, dry_run, vault, overwrite_dest, explicit, ignore_bad_manifest)
+        except ValueError as exc:
+            print(f"error: {exc}; can't inspect the trees safely. Fix permissions and retry.", file=sys.stderr)
+            return 2
 
 
 def _propagate_locked(src: Path, dest: Path, dry_run: bool, vault: Path, overwrite_dest: bool,
@@ -884,7 +905,10 @@ def self_test() -> None:
         lk = t / "links"
         write(lk / "a.md", "a\n")
         (lk / "ok.md").symlink_to("a.md")
+        (lk / "sub").mkdir()
+        (lk / "sub" / "root").symlink_to("..")  # resolves to the root itself: inside
         assert outward_links(lk) == []
+        (lk / "sub" / "root").unlink()
         (lk / "abs.md").symlink_to("/etc/hosts")
         (lk / "esc.md").symlink_to("../outside.md")
         (lk / "venv").mkdir()
@@ -1193,6 +1217,18 @@ def self_test() -> None:
         write(live28 / "skill.yaml", "name: demo28\nsecurity:\n  write_paths: ['" + str(live28) + "/x/../state.json']\n")
         assert whole_dir_declared(live28)
 
+        # a relative dest-root containing ":" stays local (rsync would read "host:path" as remote)
+        src30 = vault / ".codex" / "skills" / "demo30"
+        write(src30 / "SKILL.md", "colon-safe\n")
+        write(src30 / "skill.yaml", "name: demo30\nsecurity:\n  write_paths: ['outputs/']\n")
+        here = os.getcwd()
+        os.chdir(t)
+        try:
+            assert propagate(src30, Path("backup:skills"), False, vault) == 0
+        finally:
+            os.chdir(here)
+        assert (t / "backup:skills" / "demo30" / "SKILL.md").read_text() == "colon-safe\n"
+
         # overlapping source/destination trees are refused before anything is created
         assert propagate(src27, src27 / "test-install", False, vault) == 2
         assert not (src27 / "test-install").exists()
@@ -1234,6 +1270,32 @@ def self_test() -> None:
         assert not (vault / "outputs" / "skill-evals" / "accepted" / f"{path_key(live29)}.json").exists()
         assert propagate(live29, dest_root, False, vault) == 2 and not (dest_root / "demo29").exists()
         assert special_entries([live29], {"events.fifo"}) == []
+
+        # an unreadable directory is an error, never silently "equal"
+        live31 = vault / ".codex" / "skills" / "demo31"
+        write(live31 / "SKILL.md", "a\n")
+        write(live31 / "skill.yaml", "name: demo31\nsecurity:\n  write_paths: ['outputs/']\n")
+        write(live31 / "references" / "guide.md", "live\n")
+        st = stage(t / "run31", path_key(live31), live31)
+        write(st / "references" / "guide.md", "staged change\n")
+        os.chmod(live31 / "references", 0o111)
+        os.chmod(st / "references", 0o111)
+        try:
+            for fn in (lambda: tree_entries(live31, set()), lambda: review(live31, st, set()),
+                       lambda: outward_links(live31)):
+                try:
+                    fn()
+                    raise AssertionError("unreadable dir was silently skipped")
+                except ValueError:
+                    pass
+            assert accept(t / "run31", path_key(live31), live31, False, vault) == 2
+            assert not (vault / "outputs" / "skill-evals" / "accepted" / f"{path_key(live31)}.json").exists()
+            assert propagate(live31, dest_root, False, vault) == 2 and not (dest_root / "demo31").exists()
+        finally:
+            os.chmod(live31 / "references", 0o755)
+            os.chmod(st / "references", 0o755)
+        assert (live31 / "references" / "guide.md").read_text() == "live\n"
+        assert tree_entries(t / "does-not-exist", set()) == {}
 
         # a newly created destination takes the source root's (restrictive) mode
         src22 = vault / ".codex" / "skills" / "demo22"
@@ -1335,7 +1397,11 @@ def main() -> int:
         ident = a.identity.resolve() if a.identity else None
         protect = (state_paths(a.check_links, ident) | (effective_protect(ident, vault_root(), set(a.protect))
                                                       if ident else set(a.protect)))
-        bad = outward_links(a.check_links, protect)
+        try:
+            bad = outward_links(a.check_links, protect)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
         print("\n".join(bad) if bad else "no outward symlinks")
         return 1 if bad else 0
     if a.state_paths:
