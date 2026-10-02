@@ -100,13 +100,38 @@ def _declared(skill_dir: Path, identity: Path | None = None) -> tuple[set[str], 
         if not isinstance(entry, str):
             continue
         entry = os.path.expanduser(entry).removeprefix("./")  # no strip: quoted names keep spaces
-        if entry.startswith("/"):  # absolute: compare after resolving symlinks (/var -> /private/var)
-            rel = os.path.relpath(os.path.realpath(entry), real_dir)
-            if rel == ".." or rel.startswith("../"):
+        if entry.startswith("/"):
+            # absolute: keep the logical path under the skill dir (so symlinks along it are still
+            # seen by linked_state). The dir may be spelled resolved or not (/var vs /private/var).
+            parts = [c for c in entry.split("/") if c not in ("", ".")]
+            logical = "/" + "/".join(parts)
+            rel = None
+            for prefix in {os.path.abspath(ident), real_dir}:
+                if logical == prefix:
+                    rel = "."
+                elif logical.startswith(prefix + "/"):
+                    rel = logical[len(prefix) + 1:]
+                if rel is not None:
+                    break
+            if rel is not None and ".." in rel.split("/"):
+                whole = True  # ".." inside the skill: never guess
+                continue
+            if rel is None:
+                real = os.path.relpath(os.path.realpath(entry), real_dir)
+                if real == ".." or real.startswith("../"):
+                    continue  # really outside the skill
+                whole = True  # reaches the skill only through some symlink: unresolved scope
                 continue
         else:
-            # "/" + normalised path, so ".codex/skills/demo", ".codex/skills/demo/" and
-            # "kb/.codex/skills/demo/x" all match; "../" segments are resolved before matching
+            clean = [c for c in entry.split("/") if c not in ("", ".")]
+            if ".." in clean and any(("/" + "/".join(clean[:i])).endswith("/" + m)
+                                     for m in markers for i in range(1, len(clean) + 1)):
+                # the path walks through this skill before a "..": a symlink inside the skill can
+                # land it back in the skill even if the name normalises outside. Never guess.
+                whole = True
+                continue
+            # "/" + normalised path, so ".codex/skills/demo", "./.codex//skills/./demo/" and
+            # "kb/.codex/skills/demo/x" all match
             norm = "/" + os.path.normpath(entry)
             rel = None
             for m in markers:
@@ -118,6 +143,12 @@ def _declared(skill_dir: Path, identity: Path | None = None) -> tuple[set[str], 
                     rel = norm[at + len(m) + 2:]
                     break
             if rel is None:
+                continue
+            if ".." in entry.split("/"):
+                # e.g. ".codex/skills/./demo/cache/../state.json": the name normalises into this skill,
+                # but if cache is a symlink the OS reaches a different file. Never guess: any ".."
+                # in a path that lands in this skill is unresolved scope (refused unless reviewed).
+                whole = True
                 continue
         rel = os.path.normpath(rel)
         if rel == ".":
@@ -186,6 +217,11 @@ def recorded_protect(skill_dir: Path, vault: Path) -> set[str]:
         if record.is_file():
             out |= set(json.loads(record.read_text()).get("protect", []))
     return out
+
+
+def bad_explicit(explicit: set[str]) -> list[str]:
+    """--protect paths that aren't clean paths relative to the skill dir."""
+    return sorted(e for e in explicit if not e or e in (".", "./") or os.path.isabs(e) or ".." in e.split("/"))
 
 
 def effective_protect(skill_dir: Path, vault: Path, explicit: set[str] = frozenset()) -> set[str]:
@@ -274,17 +310,46 @@ def outward_links(root: Path, protect: set[str] = frozenset()) -> list[str]:
 
 
 def linked_state(dirs: list[Path], protect: set[str]) -> list[str]:
-    """Protected paths that are, or pass through, a symlink in any of `dirs`. rsync protects only
-    the logical path, so the file the link resolves to would be unprotected: such skills are
-    refused until the resolved files are protected explicitly."""
+    """Protected paths whose real files could lie outside the protected set, in any of `dirs`:
+    (a) the path itself, or a directory on the way to it, is a symlink; (b) a symlink *inside* a
+    protected directory resolves to unprotected content of the skill dir (an alias like
+    cache/alias -> ../data). rsync protects only the logical paths, so such skills are refused
+    until the resolved files are protected explicitly. Links that leave the skill dir (e.g. a
+    venv's python -> /opt/...) alias nothing in it and are fine."""
     hits = set()
     for d in dirs:
+        real_d = os.path.realpath(d)
         for p in protect:
             parts = p.split("/")
             for i in range(1, len(parts) + 1):
                 if os.path.islink(d / "/".join(parts[:i])):
                     hits.add(f"{d.name}: {p} (via {'/'.join(parts[:i])})")
                     break
+            base = d / p
+            if base.is_dir() and not base.is_symlink():
+                for dirpath, dnames, fnames in os.walk(base):  # links in dnames are not followed
+                    for n in dnames + fnames:
+                        link = os.path.join(dirpath, n)
+                        if not os.path.islink(link):
+                            continue
+                        target = os.path.relpath(os.path.realpath(link), real_d)
+                        if target != ".." and not target.startswith("../") and not excluded(target, protect):
+                            hits.add(f"{d.name}: {os.path.relpath(link, d)} -> unprotected {target}")
+        # (c) hard links: a protected file sharing an inode with an unprotected one would have its
+        # mode changed when rsync updates the unprotected name
+        protected_inodes, shared = {}, []
+        if d.is_dir():
+            for dirpath, dnames, fnames in os.walk(d):
+                for n in fnames:
+                    f = os.path.join(dirpath, n)
+                    st = os.lstat(f)
+                    if stat.S_ISREG(st.st_mode) and st.st_nlink > 1:
+                        rel = os.path.relpath(f, d)
+                        (protected_inodes.setdefault((st.st_dev, st.st_ino), rel) if excluded(rel, protect)
+                         else shared.append(((st.st_dev, st.st_ino), rel)))
+            for ino, rel in shared:
+                if ino in protected_inodes:
+                    hits.add(f"{d.name}: {rel} is a hard link to protected {protected_inodes[ino]}")
     return sorted(hits)
 
 
@@ -335,6 +400,10 @@ def accept(run: Path, key: str, live: Path, dry_run: bool, vault: Path,
     if not (live.is_dir() and baseline and staging):
         print(f"error: need live dir and exactly one baseline/staging dir under {run}/*/{key}", file=sys.stderr)
         return 2
+    if bad_explicit(explicit):
+        print(f"error: --protect paths must be clean relative paths inside the skill: {bad_explicit(explicit)}",
+              file=sys.stderr)
+        return 2
     if key != path_key(live):
         print(f"error: key {key} does not match the live path (expected {path_key(live)})", file=sys.stderr)
         return 2
@@ -356,7 +425,7 @@ def accept(run: Path, key: str, live: Path, dry_run: bool, vault: Path,
 def _accept_locked(key: str, live: Path, baseline: Path, staging: Path, dry_run: bool, vault: Path,
                    explicit: set[str], ignore_bad_manifest: bool) -> int:
     bad = [m for m in map(manifest_problem, (live, baseline, staging)) if m]
-    bad += [f"{d}/skill.yaml: declares the whole skill dir writable"
+    bad += [f"{d}/skill.yaml: a write path can't be resolved safely (the whole skill dir, or '..' inside it)"
             for d in (live, baseline, staging) if whole_dir_declared(d, live)]
     if bad and not ignore_bad_manifest:
         print(f"error: runtime state can't be inferred: {bad}. Fix the manifest(s), or pass every "
@@ -409,6 +478,10 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
     if not (src / "SKILL.md").is_file():
         print(f"error: {src} has no SKILL.md", file=sys.stderr)
         return 2
+    if bad_explicit(explicit):
+        print(f"error: --protect paths must be clean relative paths inside the skill: {bad_explicit(explicit)}",
+              file=sys.stderr)
+        return 2
     dest = dest_root.expanduser() / src.name
     if dest.is_symlink():
         print(f"refused: {dest} is a symlink (maintained elsewhere)", file=sys.stderr)
@@ -433,7 +506,9 @@ def propagate(src: Path, dest_root: Path, dry_run: bool, vault: Path, overwrite_
 def _propagate_locked(src: Path, dest: Path, dry_run: bool, vault: Path, overwrite_dest: bool,
                       explicit: set[str], ignore_bad_manifest: bool) -> int:
     bad = [m for m in map(manifest_problem, (src, dest)) if m]
-    bad += [f"{d}/skill.yaml: declares the whole skill dir writable" for d in (src, dest) if whole_dir_declared(d)]
+    bad += [f"{d}/skill.yaml: a write path can't be resolved safely (the whole skill dir, or '..' inside it)"
+            for d, ident in ((src, src), (dest, dest), (src, dest), (dest, src))
+            if os.path.lexists(d) and whole_dir_declared(d, ident)]
     if bad and not ignore_bad_manifest:
         print(f"error: runtime state can't be inferred: {bad}. Fix the manifest(s), or pass every "
               f"runtime file with --protect and --ignore-bad-manifest after review. Nothing copied.",
@@ -445,7 +520,10 @@ def _propagate_locked(src: Path, dest: Path, dry_run: bool, vault: Path, overwri
     record = vault / "outputs" / "skill-evals" / "propagated" / (path_key(dest) + ".json")
     rec = json.loads(record.read_text()) if record.is_file() else {}
     rec_protect = set(rec.get("protect", []))
-    protect = effective_protect(src, vault, explicit) | effective_protect(dest, vault) | rec_protect
+    # each manifest is read for both locations: the source may declare state by the destination's
+    # absolute path (and vice versa)
+    protect = (effective_protect(src, vault, explicit) | effective_protect(dest, vault) | rec_protect
+               | state_paths(src, dest) | (state_paths(dest, src) if dest.exists() else set()))
     print(f"protected runtime state: {sorted(protect) or 'none'}")
     if unsupported(protect):
         print(f"error: runtime-state names rsync can't protect literally: {unsupported(protect)}; "
@@ -880,7 +958,7 @@ def self_test() -> None:
         live17 = vault / ".codex" / "skills" / "demo17"
         write(live17 / "SKILL.md", "a\n")
         write(live17 / "skill.yaml", "name: demo17\nsecurity:\n  write_paths: ['.codex/skills/demo17/..state.json', "
-              "'.codex/skills/demo17/ padded.json', '.codex/skills/demo17/../escape.json']\n")
+              "'.codex/skills/demo17/ padded.json']\n")
         write(live17 / "..state.json", "S1")
         write(live17 / " padded.json", "S2")
         assert state_paths(live17) == {"..state.json", " padded.json"}, state_paths(live17)
@@ -923,7 +1001,7 @@ def self_test() -> None:
             write(live19 / "skill.yaml", f"name: demo19\nsecurity:\n  write_paths: ['{spelling}']\n")
             assert whole_dir_declared(live19) and state_paths(live19) == set(), spelling
         write(live19 / "skill.yaml", "name: demo19\nsecurity:\n  write_paths: ['.codex/skills/demo19x/a', "
-              "'.codex/skills/demo19/../other/a', 'kb/.codex/skills/demo19/cache/x.json']\n")
+              "'../../.codex/registry.json', '.codex/skills/other/../x', 'kb/.codex/skills/demo19/cache/x.json']\n")
         assert not whole_dir_declared(live19) and state_paths(live19) == {"cache/x.json"}, state_paths(live19)
 
         # the destination root is never widened; the source root's mode is restored afterwards
@@ -955,6 +1033,89 @@ def self_test() -> None:
             assert stat.S_IMODE(os.stat(a20).st_mode) == src_m and stat.S_IMODE(os.stat(b20).st_mode) == dest_m
             assert "--no-owner" in cmd and "--no-group" in cmd
 
+        # ".." after an internal dir symlink: the OS reaches a different file; refuse, never guess
+        live24 = vault / ".codex" / "skills" / "demo24"
+        write(live24 / "SKILL.md", "a\n")
+        write(live24 / "skill.yaml", "name: demo24\nsecurity:\n  write_paths: ['.codex/skills/demo24/cache/../state.json']\n")
+        write(live24 / "data" / "nested" / "keep.txt", "k")
+        write(live24 / "data" / "state.json", "REAL-STATE")
+        (live24 / "cache").symlink_to("data/nested")
+        assert whole_dir_declared(live24) and state_paths(live24) == set()
+        for spelling in (".codex/skills/./demo24/cache/../state.json", ".codex/skills//demo24/cache/../state.json",
+                         ".codex/x/../skills/demo24/state.json", "./.codex/skills/demo24/cache/../state.json"):
+            write(live24 / "skill.yaml", f"name: demo24\nsecurity:\n  write_paths: ['{spelling}']\n")
+            assert whole_dir_declared(live24) and state_paths(live24) == set(), spelling
+            write(dest_root / "demo24" / "data" / "state.json", "INSTALLED")
+            assert propagate(live24, dest_root, False, vault, overwrite_dest=True) == 2, spelling
+            assert (dest_root / "demo24" / "data" / "state.json").read_text() == "INSTALLED"
+        write(live24 / "skill.yaml", "name: demo24\nsecurity:\n  write_paths: ['.codex/skills/./demo24/cache/../state.json']\n")
+        st = stage(t / "run24", path_key(live24), live24)
+        (st / "data" / "state.json").unlink()
+        assert accept(t / "run24", path_key(live24), live24, False, vault) == 2
+        assert (live24 / "data" / "state.json").read_text() == "REAL-STATE"
+        for bad in ("cache/../state.json", "/abs/state.json", ".", ""):
+            assert accept(t / "run24", path_key(live24), live24, False, vault, explicit={bad},
+                          ignore_bad_manifest=True) == 2, bad
+            assert propagate(live24, dest_root, False, vault, explicit={bad}) == 2, bad
+        assert accept(t / "run24", path_key(live24), live24, False, vault, explicit={"data/state.json"},
+                      ignore_bad_manifest=True) == 0
+        assert (live24 / "data" / "state.json").read_text() == "REAL-STATE"
+
+        # ".." that lexically leaves the skill but physically lands back in it through a symlink
+        live25 = vault / ".codex" / "skills" / "demo25"
+        write(live25 / "SKILL.md", "a\n")
+        write(live25 / "skill.yaml", "name: demo25\nsecurity:\n  write_paths: ['.codex/skills/demo25/cache/../../state.json']\n")
+        write(live25 / "data" / "nested" / "k.txt", "k")
+        write(live25 / "state.json", "REAL")
+        (live25 / "cache").symlink_to("data/nested")
+        assert whole_dir_declared(live25) and state_paths(live25) == set()
+        st = stage(t / "run25", path_key(live25), live25)
+        (st / "state.json").unlink()
+        assert accept(t / "run25", path_key(live25), live25, False, vault) == 2
+        assert (live25 / "state.json").read_text() == "REAL"
+
+        # a protected file hard-linked to an unprotected one: refuse until the alias is protected
+        live26 = vault / ".codex" / "skills" / "demo26"
+        write(live26 / "SKILL.md", "a\n")
+        write(live26 / "skill.yaml", "name: demo26\nsecurity:\n  write_paths: ['.codex/skills/demo26/cache/state.json']\n")
+        write(live26 / "cache" / "state.json", "SECRET")
+        os.chmod(live26 / "cache" / "state.json", 0o600)
+        (live26 / "assets").mkdir()
+        os.link(live26 / "cache" / "state.json", live26 / "assets" / "sample.json")
+        assert linked_state([live26], {"cache/state.json"}) == ["demo26: assets/sample.json is a hard link to protected cache/state.json"]
+        st = stage(t / "run26", path_key(live26), live26)
+        os.chmod(st / "assets" / "sample.json", 0o644)
+        assert accept(t / "run26", path_key(live26), live26, False, vault) == 2
+        assert stat.S_IMODE(os.stat(live26 / "cache" / "state.json").st_mode) == 0o600
+        assert linked_state([live26], {"cache/state.json", "assets/sample.json"}) == []
+
+        # the source manifest may name the destination's absolute path: still protected there
+        src27 = vault / ".codex" / "skills" / "demo27"
+        write(src27 / "SKILL.md", "v2\n")
+        write(src27 / "skill.yaml", "name: demo27\nsecurity:\n  write_paths: ['"
+              + str(dest_root / "demo27") + "/last_run.json']\n")
+        write(dest_root / "demo27" / "SKILL.md", "v1\n")
+        write(dest_root / "demo27" / "skill.yaml", "name: demo27\nsecurity:\n  write_paths: ['outputs/']\n")
+        write(dest_root / "demo27" / "last_run.json", "INSTALLED")
+        assert state_paths(src27) == set() and state_paths(src27, dest_root / "demo27") == {"last_run.json"}
+        assert propagate(src27, dest_root, False, vault, overwrite_dest=True) == 0
+        assert (dest_root / "demo27" / "last_run.json").read_text() == "INSTALLED"
+
+        # an absolute declaration keeps its logical path, so a symlinked state alias is refused
+        live28 = vault / ".codex" / "skills" / "demo28"
+        write(live28 / "SKILL.md", "a\n")
+        write(live28 / "data" / "state.json", "S")
+        (live28 / "state.json").symlink_to("data/state.json")
+        write(live28 / "skill.yaml", "name: demo28\nsecurity:\n  write_paths: ['" + str(live28) + "/state.json']\n")
+        assert state_paths(live28) == {"state.json"}
+        assert linked_state([live28], state_paths(live28))
+        st = stage(t / "run28", path_key(live28), live28)
+        (st / "state.json").unlink()
+        assert accept(t / "run28", path_key(live28), live28, False, vault) == 2
+        assert (live28 / "state.json").is_symlink()
+        write(live28 / "skill.yaml", "name: demo28\nsecurity:\n  write_paths: ['" + str(live28) + "/x/../state.json']\n")
+        assert whole_dir_declared(live28)
+
         # a newly created destination takes the source root's (restrictive) mode
         src22 = vault / ".codex" / "skills" / "demo22"
         write(src22 / "SKILL.md", "private\n")
@@ -980,6 +1141,27 @@ def self_test() -> None:
                       ignore_bad_manifest=True) == 0
         assert (live21 / "data" / "state.json").read_text() == "LIVE-STATE" and (live21 / "SKILL.md").read_text() == "b\n"
         assert propagate(live21, dest_root, False, vault) == 2
+
+        # a symlink inside a protected dir that aliases unprotected in-skill content is refused;
+        # links leaving the skill dir (like a venv's python) and links within protected content are fine
+        live23 = vault / ".codex" / "skills" / "demo23"
+        write(live23 / "SKILL.md", "a\n")
+        write(live23 / "skill.yaml", "name: demo23\nsecurity:\n  write_paths: ['.codex/skills/demo23/cache/']\n")
+        write(live23 / "data" / "state.json", "LIVE")
+        (live23 / "cache").mkdir()
+        (live23 / "cache" / "py").symlink_to("/usr/bin/python3")
+        write(live23 / "cache" / "real.json", "R")
+        (live23 / "cache" / "inner").symlink_to("real.json")
+        assert linked_state([live23], {"cache"}) == []
+        (live23 / "cache" / "alias").symlink_to("../data")
+        assert linked_state([live23], {"cache"}) == ["demo23: cache/alias -> unprotected data"]
+        st = stage(t / "run23", path_key(live23), live23)
+        write(st / "data" / "state.json", "STAGED")
+        assert accept(t / "run23", path_key(live23), live23, False, vault) == 2
+        assert (live23 / "data" / "state.json").read_text() == "LIVE"
+        assert accept(t / "run23", path_key(live23), live23, False, vault, explicit={"data"},
+                      ignore_bad_manifest=True) == 0
+        assert (live23 / "data" / "state.json").read_text() == "LIVE"
     print("self-test ok")
 
 

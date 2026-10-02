@@ -50,7 +50,7 @@ outputs:
     - T1/T2 tests run in disposable temp dirs (mktemp) that are deleted afterwards.
 dependencies:
   skills:
-    - anthropic-skills:skill-creator (official; evals, benchmarks, description optimization; optional)
+    - anthropic-skills:skill-creator (official; behavioral evals and benchmarks; its run_eval.py is used inside the isolated T1 procedure; optional)
   scripts:
     - .codex/skills/skill-creator/scripts/validate_skill_manifest.py
     - .codex/skills/skill-creator/scripts/lint_skill.py
@@ -101,6 +101,6 @@ schedule_eligibility:
 security:
   risk_level: write
   confirmation_required: false
-  reason: Writes skill files under .codex/skills/ (new skills, accepted updates) and run artifacts and locks under outputs/skill-evals/; delegated official description optimization writes temporary command stubs to .claude/commands/ and removes them; human-invoked only.
-  write_paths: [".codex/skills/<name>/", "outputs/skill-evals/", ".claude/commands/"]
+  reason: Writes skill files under .codex/skills/ (new skills, accepted updates) and run artifacts and locks under outputs/skill-evals/; trigger tests write only to disposable temp dirs; human-invoked only.
+  write_paths: [".codex/skills/<name>/", "outputs/skill-evals/"]
 agents: [claude, codex]

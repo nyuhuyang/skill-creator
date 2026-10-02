@@ -53,9 +53,10 @@ Start from `assets/skill.yaml.template`.
 
 ## Evals and the official skill-creator
 
-- Claude Code: for evals, benchmarks, A/B comparison or description optimization, use `/anthropic-skills:skill-creator`.
+- Claude Code: for behavioral evals, benchmarks or A/B comparison, use `/anthropic-skills:skill-creator`.
 - Codex: if `claude` is on PATH and `ls -d ~/.claude/skills/synced/*/skill-creator | head -1` finds the official copy, read that copy's SKILL.md eval section and run cases with `claude -p`. Otherwise skip benchmarking and report "evals not run — official skill-creator unavailable in this harness".
-- Put eval workspaces in `outputs/skill-evals/<skill-name>/`, never next to the skill under `.codex/skills/`. For description optimization, the official `run_eval.py` writes and then deletes command stubs under the nearest ancestor `.claude/`, which is `~/.claude/` if the vault has none. From the vault root, run `mkdir -p .claude/commands outputs/skill-evals/<skill-name>`, then confirm that `PYTHONPATH=<official skill-creator dir> python3 -c "import scripts.run_eval as m; print(m.find_project_root())"` prints the vault root. Stop if it prints anything else. Then run `PYTHONPATH=<official skill-creator dir> python3 -m scripts.run_loop ... --results-dir outputs/skill-evals/<skill-name>/ --report outputs/skill-evals/<skill-name>/report.html`.
+- Put eval workspaces in `outputs/skill-evals/<skill-name>/`, never next to the skill under `.codex/skills/`.
+- Trigger testing and description tuning follow only the T1 procedure in `references/updating.md`: a disposable project, the installed copy verified hidden, and `t1_check.py` validating each run, with at most 2 revision rounds. Do not run the official `run_loop` for this. It scores against the installed copy and skips those checks.
 - Where the official skill-creator's structural advice conflicts with `references/best-practices.md` (contents-list threshold, extra reference hierarchy), the reference wins. Do not use its `quick_validate.py` on Claude Code skills; use `lint_skill.py`.
 
 ## Updating and testing skills (one or many)

@@ -207,9 +207,12 @@ Acceptance is a fragile operation, so a script does it:
     the canonical-path key of `--live`, or the run is refused.
   - It refuses if the live copy changed since staging (exit 4 = re-stage and re-review).
   - It refuses (exit 2, nothing copied) if any involved `skill.yaml` can't be read, or declares the
-    whole skill dir writable (`.codex/skills/<name>/`), or declares state through a symlink (for example
+    whole skill dir writable (`.codex/skills/<name>/`), uses `..` inside the skill dir (for example
+    `.codex/skills/<name>/cache/../state.json`, or any `..` path that passes through the skill), has a
+    protected file hard-linked to an unprotected one, or declares state through a symlink (for example
     `cache/state.json` where `cache -> data`), because the runtime state can't be inferred then.
-    For the symlink case, protect the resolved files (`--protect data/state.json`). Proceed only after the user reviews a full `--protect` list,
+    For the symlink case, protect the resolved files (`--protect data/state.json`). `--protect` paths must be
+    clean paths relative to the skill dir (no `..`, not absolute). Proceed only after the user reviews a full `--protect` list,
     passing `--ignore-bad-manifest`.
   - It protects runtime state: the union of the state paths declared by the live, baseline and
     staging manifests, plus every path protected for that directory by an earlier acceptance or
